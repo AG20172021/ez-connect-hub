@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { Send, Plus, ChevronDown, ChevronRight, MoreHorizontal, Copy, Check } from 'lucide-react';
-import { ApiCollection, ApiRequest, Environment, EnvironmentVariable, HttpMethod, ApiResponse } from '../types';
+import { ApiCollection, ApiRequest, Environment, HttpMethod, ApiResponse } from '../types';
 
 const methods: HttpMethod[] = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
 
@@ -18,7 +18,7 @@ const authTypes = ['No Auth', 'Basic Auth', 'Bearer Token', 'JWT Bearer', 'OAuth
 
 const bodyModes = ['none', 'form-data', 'x-www-form-urlencoded', 'raw', 'binary'];
 
-const httpVersions = ['Auto', 'HTTP/1', 'HTTP/1.1', 'HTTP/2'];
+const httpVersions: Array<'Auto' | 'HTTP/1' | 'HTTP/1.1' | 'HTTP/2'> = ['Auto', 'HTTP/1', 'HTTP/1.1', 'HTTP/2'];
 
 export function ApiClient() {
   // Collections state
@@ -36,7 +36,7 @@ export function ApiClient() {
   ]);
 
   // Environments state
-  const [environments, setEnvironments] = useState<Environment[]>([
+  const [environments] = useState<Environment[]>([
     { id: '1', name: 'Development', variables: [{ id: '1', name: 'base_url', initialValue: 'https://dev.api.example.com', currentValue: 'https://dev.api.example.com', isSecret: false }] },
     { id: '2', name: 'Production', variables: [{ id: '1', name: 'base_url', initialValue: 'https://api.example.com', currentValue: 'https://api.example.com', isSecret: false }] }
   ]);

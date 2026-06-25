@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { X, Check, AlertCircle, Loader2 } from 'lucide-react';
-import { FileConnection, DbConnection, FileConnectorType, DbConnectorType } from '../types';
+import { FileConnection, DbConnection } from '../types';
 
 interface ConnectionModalProps {
   connection: FileConnection | DbConnection | null;

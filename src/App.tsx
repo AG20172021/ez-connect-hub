@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
-import { FolderOpen, Database, Globe, Plus, Settings, Check } from 'lucide-react';
-import { FileConnection, DbConnection, ApiCollection, Environment, NavSection } from './types';
+import { useState } from 'react';
+import { FolderOpen, Database, Globe, Settings, Check } from 'lucide-react';
+import { FileConnection, DbConnection, NavSection } from './types';
 import { ConnectionModal } from './components/ConnectionModal';
 import { ApiClient } from './components/ApiClient';
 

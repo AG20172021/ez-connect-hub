@@ -378,7 +378,7 @@ export function ApiClient() {
                 <div className="settings-section">
                   <div className="setting-row">
                     <span>HTTP version</span>
-                    <select value={selectedRequest.settings.httpVersion} onChange={e => updateRequest({ settings: { ...selectedRequest.settings, httpVersion: e.target.value } })}>
+                    <select value={selectedRequest.settings.httpVersion} onChange={e => updateRequest({ settings: { ...selectedRequest.settings, httpVersion: e.target.value as 'Auto' | 'HTTP/1' | 'HTTP/1.1' | 'HTTP/2' } })}>
                       {httpVersions.map(v => <option key={v} value={v}>{v}</option>)}
                     </select>
                     <span className="badge-new">NEW</span>

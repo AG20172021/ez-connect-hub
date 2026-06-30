@@ -736,7 +736,7 @@ async function profileFile(payload) {
 
   const format = profileFormat(fileName || filePath, file.kind);
   if (!format) {
-    return profilePlaceholder(filePath, `unsupported_format_${String(file.kind || fileKind(fileName || filePath)).toLowerCase()}`);
+    return profilePlaceholder(filePath, `unsupported_format_${statusToken(file.kind || fileKind(fileName || filePath))}`);
   }
 
   let sample;
@@ -770,28 +770,42 @@ async function profileFile(payload) {
 function profileFormat(fileName, kind) {
   const lowerName = String(fileName || '').toLowerCase();
   const lowerKind = String(kind || '').toLowerCase();
+  const contentType = normalizeContentType(kind);
 
-  if (lowerName.endsWith('.jsonl') || lowerName.endsWith('.ndjson') || ['jsonl', 'ndjson'].includes(lowerKind)) {
+  if (
+    lowerName.endsWith('.jsonl') ||
+    lowerName.endsWith('.ndjson') ||
+    ['jsonl', 'ndjson'].includes(lowerKind) ||
+    ['application/x-ndjson', 'application/ndjson', 'application/jsonl', 'application/x-jsonlines'].includes(contentType)
+  ) {
     return { type: 'jsonl', label: 'jsonl' };
   }
 
-  if (lowerName.endsWith('.json') || lowerKind === 'json') {
+  if (lowerName.endsWith('.json') || lowerKind === 'json' || contentType === 'application/json') {
     return { type: 'json', label: 'json' };
   }
 
-  if (lowerName.endsWith('.tsv') || lowerKind === 'tsv') {
+  if (lowerName.endsWith('.tsv') || lowerKind === 'tsv' || contentType === 'text/tab-separated-values') {
     return { type: 'delimited', label: 'tsv', delimiter: '\t' };
   }
 
-  if (lowerName.endsWith('.csv') || lowerKind === 'csv') {
+  if (
+    lowerName.endsWith('.csv') ||
+    lowerKind === 'csv' ||
+    ['text/csv', 'application/csv', 'application/vnd.ms-excel'].includes(contentType)
+  ) {
     return { type: 'delimited', label: 'csv', delimiter: ',' };
   }
 
-  if (lowerName.endsWith('.txt') || lowerKind === 'txt') {
+  if (lowerName.endsWith('.txt') || lowerKind === 'txt' || contentType === 'text/plain') {
     return { type: 'delimited', label: 'delimited' };
   }
 
   return null;
+}
+
+function normalizeContentType(value) {
+  return String(value || '').split(';')[0].trim().toLowerCase();
 }
 
 function profilePlaceholder(filePath, status) {
@@ -809,7 +823,7 @@ function profilePlaceholder(filePath, status) {
 function profileErrorStatus(error) {
   const message = error instanceof Error ? error.message : 'profile_error';
   if (/Azure Blob 403 AuthorizationResourceTypeMismatch/i.test(message)) {
-    return 'not_profiled_azure_sas_needs_blob_or_object_resource';
+    return 'not_profiled_azure_sas_can_list_but_cannot_read_blob_content';
   }
   if (/Azure Blob 403 AuthorizationPermissionMismatch/i.test(message)) {
     return 'not_profiled_azure_sas_needs_read_permission';
@@ -1340,7 +1354,26 @@ function decodeXml(text) {
 function fileKind(name, contentType = '') {
   const ext = path.posix.extname(name).replace('.', '').toUpperCase();
   if (ext) return ext;
-  if (contentType) return contentType;
+  const normalizedType = normalizeContentType(contentType);
+  switch (normalizedType) {
+    case 'text/csv':
+    case 'application/csv':
+    case 'application/vnd.ms-excel':
+      return 'CSV';
+    case 'text/tab-separated-values':
+      return 'TSV';
+    case 'application/json':
+      return 'JSON';
+    case 'application/x-ndjson':
+    case 'application/ndjson':
+    case 'application/jsonl':
+    case 'application/x-jsonlines':
+      return 'JSONL';
+    case 'text/plain':
+      return 'TXT';
+    default:
+      if (contentType) return contentType;
+  }
   return 'File';
 }
 

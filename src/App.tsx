@@ -6,6 +6,9 @@ type Section = 'files' | 'database' | 'api';
 type ConnectorType = 's3' | 'gcs' | 'azure' | 'sftp' | 'local';
 type ConnectionStatus = 'connected' | 'disconnected';
 type RequestMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD';
+type ApiTab = 'params' | 'authorization' | 'headers' | 'body' | 'settings';
+type AuthType = 'No Auth' | 'Basic Auth' | 'Bearer Token' | 'JWT Bearer' | 'Digest Auth' | 'OAuth 1.0' | 'OAuth 2.0' | 'Hawk Authentication' | 'AWS Signature' | 'NTLM Authentication' | 'API Key' | 'Akamai EdgeGrid' | 'ASAP (Atlassian)';
+type Transport = 'browser' | 'server';
 
 type Field = {
   key: string;
@@ -70,6 +73,20 @@ type ApiResponse = {
   error?: string;
 };
 
+type ApiSettings = {
+  httpVersion: 'Auto' | 'HTTP/1' | 'HTTP/1.1' | 'HTTP/2';
+  sslVerification: boolean;
+  followRedirects: boolean;
+  followOriginalMethod: boolean;
+  followAuthHeader: boolean;
+  removeRefererOnRedirect: boolean;
+  strictHttpParser: boolean;
+  encodeUrlAutomatically: boolean;
+  disableCookieJar: boolean;
+  useServerCipherSuite: boolean;
+  maxRedirects: number;
+};
+
 const fileConnectors: FileConnection[] = [
   { id: 's3', type: 's3', name: 'Amazon S3', status: 'disconnected', color: '#FF9900', icon: 'S3', config: {} },
   { id: 'gcs', type: 'gcs', name: 'Google Cloud Storage', status: 'disconnected', color: '#4285F4', icon: 'GCS', config: {} },
@@ -130,6 +147,21 @@ const dbFields: Field[] = [
 ];
 
 const methods: RequestMethod[] = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'];
+const authTypes: AuthType[] = ['No Auth', 'Basic Auth', 'Bearer Token', 'JWT Bearer', 'Digest Auth', 'OAuth 1.0', 'OAuth 2.0', 'Hawk Authentication', 'AWS Signature', 'NTLM Authentication', 'API Key', 'Akamai EdgeGrid', 'ASAP (Atlassian)'];
+
+const defaultApiSettings: ApiSettings = {
+  httpVersion: 'Auto',
+  sslVerification: false,
+  followRedirects: true,
+  followOriginalMethod: false,
+  followAuthHeader: false,
+  removeRefererOnRedirect: false,
+  strictHttpParser: false,
+  encodeUrlAutomatically: true,
+  disableCookieJar: false,
+  useServerCipherSuite: false,
+  maxRedirects: 10
+};
 
 function App() {
   const [activeSection, setActiveSection] = useState<Section>('files');
@@ -441,10 +473,17 @@ function DatabasePage({ connections, onConfigure }: { connections: DbConnection[
 function ApiPage() {
   const [method, setMethod] = useState<RequestMethod>('GET');
   const [url, setUrl] = useState('https://api.github.com/repos/AG20172021/ez-connect-hub');
+  const [params, setParams] = useState<HeaderRow[]>([{ id: 'sample-param', key: '', value: '', enabled: true }]);
   const [headers, setHeaders] = useState<HeaderRow[]>([{ id: 'content-type', key: 'Accept', value: 'application/json', enabled: true }]);
   const [body, setBody] = useState('');
+  const [activeTab, setActiveTab] = useState<ApiTab>('authorization');
+  const [authType, setAuthType] = useState<AuthType>('OAuth 2.0');
+  const [authDropdownOpen, setAuthDropdownOpen] = useState(false);
   const [authToken, setAuthToken] = useState('');
-  const [transport, setTransport] = useState<'browser' | 'server'>('browser');
+  const [apiKeyName, setApiKeyName] = useState('api_key');
+  const [apiKeyValue, setApiKeyValue] = useState('');
+  const [transport, setTransport] = useState<Transport>('browser');
+  const [settings, setSettings] = useState<ApiSettings>(defaultApiSettings);
   const [sending, setSending] = useState(false);
   const [response, setResponse] = useState<ApiResponse | null>(null);
 
@@ -453,9 +492,28 @@ function ApiPage() {
     headers.filter(header => header.enabled && header.key.trim()).forEach(header => {
       next[header.key.trim()] = header.value;
     });
-    if (authToken.trim()) next.Authorization = `Bearer ${authToken.trim()}`;
+    if (['Bearer Token', 'JWT Bearer', 'OAuth 2.0'].includes(authType) && authToken.trim()) {
+      next.Authorization = `Bearer ${authToken.trim()}`;
+    }
+    if (authType === 'API Key' && apiKeyValue.trim() && apiKeyName.trim()) {
+      next[apiKeyName.trim()] = apiKeyValue.trim();
+    }
     return next;
-  }, [authToken, headers]);
+  }, [apiKeyName, apiKeyValue, authToken, authType, headers]);
+
+  const requestUrl = useMemo(() => {
+    const enabledParams = params.filter(param => param.enabled && param.key.trim());
+    if (enabledParams.length === 0) return url;
+
+    try {
+      const next = new URL(url);
+      enabledParams.forEach(param => next.searchParams.set(param.key.trim(), param.value));
+      return next.toString();
+    } catch {
+      const separator = url.includes('?') ? '&' : '?';
+      return `${url}${separator}${enabledParams.map(param => `${encodeURIComponent(param.key.trim())}=${encodeURIComponent(param.value)}`).join('&')}`;
+    }
+  }, [params, url]);
 
   async function sendRequest() {
     setSending(true);
@@ -465,16 +523,17 @@ function ApiPage() {
         const res = await fetch('/api/http/request', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ method, url, headers: headerObject, body })
+          body: JSON.stringify({ method, url: requestUrl, headers: headerObject, body })
         });
         const data = await res.json();
         if (!res.ok || data.error) throw new Error(data.error || `Request failed with ${res.status}`);
         setResponse({ ...data, timeMs: data.timeMs || Math.round(performance.now() - started) });
       } else {
-        const res = await fetch(url, {
+        const res = await fetch(requestUrl, {
           method,
           headers: headerObject,
-          body: ['GET', 'HEAD'].includes(method) ? undefined : body
+          body: ['GET', 'HEAD'].includes(method) ? undefined : body,
+          redirect: settings.followRedirects ? 'follow' : 'manual'
         });
         const text = await res.text();
         setResponse({
@@ -502,48 +561,211 @@ function ApiPage() {
   return (
     <div className="api-workspace">
       <header className="request-line">
-        <select value={method} onChange={event => setMethod(event.target.value as RequestMethod)}>
+        <select className="method-select" value={method} onChange={event => setMethod(event.target.value as RequestMethod)}>
           {methods.map(option => <option key={option} value={option}>{option}</option>)}
         </select>
         <input value={url} onChange={event => setUrl(event.target.value)} placeholder="https://api.example.com/resource" />
         <button className="primary-action" disabled={sending || !url.trim()} onClick={() => void sendRequest()}><Send size={15} />{sending ? 'Sending...' : 'Send'}</button>
       </header>
 
-      <div className="api-grid">
-        <section className="api-panel">
-          <div className="panel-header"><h2>Request</h2></div>
-          <label className="form-field">Transport
-            <select value={transport} onChange={event => setTransport(event.target.value as 'browser' | 'server')}>
-              <option value="browser">Browser fetch</option>
-              <option value="server">Server proxy</option>
-            </select>
-          </label>
-          <label className="form-field">Bearer Token<input type="password" value={authToken} onChange={event => setAuthToken(event.target.value)} /></label>
-
-          <div className="kv-header"><span>Headers</span><button className="icon-action" onClick={() => setHeaders([...headers, { id: crypto.randomUUID(), key: '', value: '', enabled: true }])}><Plus size={15} /></button></div>
-          {headers.map((header, index) => (
-            <div className="kv-row" key={header.id}>
-              <input type="checkbox" checked={header.enabled} onChange={event => updateHeader(headers, setHeaders, index, { enabled: event.target.checked })} />
-              <input value={header.key} placeholder="Header" onChange={event => updateHeader(headers, setHeaders, index, { key: event.target.value })} />
-              <input value={header.value} placeholder="Value" onChange={event => updateHeader(headers, setHeaders, index, { value: event.target.value })} />
-              <button className="icon-action" onClick={() => setHeaders(headers.filter(item => item.id !== header.id))}><Trash2 size={14} /></button>
-            </div>
+      <section className="api-panel request-panel">
+        <div className="api-tabs">
+          {(['params', 'authorization', 'headers', 'body', 'settings'] as ApiTab[]).map(tab => (
+            <button key={tab} className={activeTab === tab ? 'active' : ''} onClick={() => setActiveTab(tab)}>
+              {tab === 'params' ? 'Params' : tab.charAt(0).toUpperCase() + tab.slice(1)}
+            </button>
           ))}
+        </div>
 
-          {!['GET', 'HEAD'].includes(method) && <label className="form-field">Body<textarea rows={10} value={body} onChange={event => setBody(event.target.value)} /></label>}
-        </section>
+        {activeTab === 'params' && (
+          <KeyValueEditor
+            addLabel="Add Parameter"
+            keyPlaceholder="Key"
+            rows={params}
+            valuePlaceholder="Value"
+            onAdd={() => setParams([...params, emptyRow()])}
+            onChange={(index, patch) => updateHeader(params, setParams, index, patch)}
+            onRemove={id => setParams(params.filter(item => item.id !== id))}
+          />
+        )}
 
-        <section className="api-panel">
-          <div className="panel-header"><h2>Response</h2>{response && <span className={response.status > 0 && response.status < 400 ? 'status-pill connected' : 'status-pill'}>{response.status || 'ERR'} {response.statusText}</span>}</div>
-          {response ? (
-            <>
-              <div className="response-meta"><span>{response.timeMs} ms</span><span>{formatBytes(new Blob([response.body]).size)}</span></div>
-              <pre className={response.error ? 'response-body error' : 'response-body'}>{prettyBody(response.body)}</pre>
-            </>
-          ) : <EmptyState title="No response yet" />}
-        </section>
+        {activeTab === 'authorization' && (
+          <div className="auth-section">
+            <label className="form-field auth-type-field">Type
+              <div className="auth-select">
+                <button type="button" onClick={() => setAuthDropdownOpen(!authDropdownOpen)}>
+                  <span>{authType}</span>
+                  <span className="select-chevron">⌄</span>
+                </button>
+                {authDropdownOpen && (
+                  <div className="auth-menu">
+                    {authTypes.map(option => (
+                      <button key={option} className={authType === option ? 'selected' : ''} onClick={() => { setAuthType(option); setAuthDropdownOpen(false); }}>
+                        <span>{authType === option ? '✓' : ''}</span>
+                        {option}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </label>
+
+            {['Bearer Token', 'JWT Bearer', 'OAuth 2.0'].includes(authType) && (
+              <label className="form-field">Token<input type="password" value={authToken} onChange={event => setAuthToken(event.target.value)} /></label>
+            )}
+
+            {authType === 'API Key' && (
+              <div className="api-key-grid">
+                <label className="form-field">Key<input value={apiKeyName} onChange={event => setApiKeyName(event.target.value)} /></label>
+                <label className="form-field">Value<input type="password" value={apiKeyValue} onChange={event => setApiKeyValue(event.target.value)} /></label>
+              </div>
+            )}
+
+            {authType !== 'No Auth' && !['Bearer Token', 'JWT Bearer', 'OAuth 2.0', 'API Key'].includes(authType) && (
+              <div className="message error">This auth type is shown to match the design, but only Bearer/OAuth token and API key headers are wired in this pass.</div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'headers' && (
+          <KeyValueEditor
+            addLabel="Add Header"
+            keyPlaceholder="Header"
+            rows={headers}
+            valuePlaceholder="Value"
+            onAdd={() => setHeaders([...headers, emptyRow()])}
+            onChange={(index, patch) => updateHeader(headers, setHeaders, index, patch)}
+            onRemove={id => setHeaders(headers.filter(item => item.id !== id))}
+          />
+        )}
+
+        {activeTab === 'body' && (
+          <label className="form-field body-editor">Raw Body<textarea rows={14} value={body} onChange={event => setBody(event.target.value)} disabled={['GET', 'HEAD'].includes(method)} /></label>
+        )}
+
+        {activeTab === 'settings' && <ApiSettingsPanel settings={settings} transport={transport} onSettingsChange={setSettings} onTransportChange={setTransport} />}
+      </section>
+
+      <section className="api-panel response-panel">
+        <div className="panel-header"><h2>Response</h2>{response && <span className={response.status > 0 && response.status < 400 ? 'status-pill connected' : 'status-pill'}>{response.status || 'ERR'} {response.statusText}</span>}</div>
+        {response ? (
+          <>
+            <div className="response-meta"><span>{response.timeMs} ms</span><span>{formatBytes(new Blob([response.body]).size)}</span></div>
+            <pre className={response.error ? 'response-body error' : 'response-body'}>{prettyBody(response.body)}</pre>
+          </>
+        ) : <EmptyState title="No response yet" />}
+      </section>
+    </div>
+  );
+}
+
+function KeyValueEditor({
+  addLabel,
+  keyPlaceholder,
+  rows,
+  valuePlaceholder,
+  onAdd,
+  onChange,
+  onRemove
+}: {
+  addLabel: string;
+  keyPlaceholder: string;
+  rows: HeaderRow[];
+  valuePlaceholder: string;
+  onAdd: () => void;
+  onChange: (index: number, patch: Partial<HeaderRow>) => void;
+  onRemove: (id: string) => void;
+}) {
+  return (
+    <div className="kv-table">
+      <div className="kv-header"><span>{keyPlaceholder}</span><span>{valuePlaceholder}</span><span></span></div>
+      {rows.map((row, index) => (
+        <div className="kv-row" key={row.id}>
+          <input type="checkbox" checked={row.enabled} onChange={event => onChange(index, { enabled: event.target.checked })} />
+          <input value={row.key} placeholder={keyPlaceholder} onChange={event => onChange(index, { key: event.target.value })} />
+          <input value={row.value} placeholder={valuePlaceholder} onChange={event => onChange(index, { value: event.target.value })} />
+          <button className="icon-action" onClick={() => onRemove(row.id)}><Trash2 size={14} /></button>
+        </div>
+      ))}
+      <button className="add-row-button" onClick={onAdd}><Plus size={15} />{addLabel}</button>
+    </div>
+  );
+}
+
+function ApiSettingsPanel({
+  settings,
+  transport,
+  onSettingsChange,
+  onTransportChange
+}: {
+  settings: ApiSettings;
+  transport: Transport;
+  onSettingsChange: (settings: ApiSettings) => void;
+  onTransportChange: (transport: Transport) => void;
+}) {
+  const update = (patch: Partial<ApiSettings>) => onSettingsChange({ ...settings, ...patch });
+
+  return (
+    <div className="api-settings-panel">
+      <SettingRow
+        label="Transport"
+        description="Choose whether the browser sends the request directly or asks the server proxy to send it."
+        control={
+          <select className="compact-select" value={transport} onChange={event => onTransportChange(event.target.value as Transport)}>
+            <option value="browser">Browser fetch</option>
+            <option value="server">Server proxy</option>
+          </select>
+        }
+      />
+      <SettingRow
+        label="HTTP version"
+        description="Select the HTTP version to use for sending the request."
+        badge="NEW"
+        defaultText="Default: Settings"
+        control={
+          <select className="compact-select" value={settings.httpVersion} onChange={event => update({ httpVersion: event.target.value as ApiSettings['httpVersion'] })}>
+            <option value="Auto">Auto</option>
+            <option value="HTTP/1">HTTP/1</option>
+            <option value="HTTP/1.1">HTTP/1.1</option>
+            <option value="HTTP/2">HTTP/2</option>
+          </select>
+        }
+      />
+      <SettingRow label="Enable SSL certificate verification" description="Verify SSL certificates when sending a request. Verification failures will result in the request being aborted." defaultText="Default: Settings" control={<Toggle checked={settings.sslVerification} onChange={value => update({ sslVerification: value })} />} />
+      <SettingRow label="Automatically follow redirects" description="Follow HTTP 3xx responses as redirects." defaultText="Default: Settings" control={<Toggle checked={settings.followRedirects} onChange={value => update({ followRedirects: value })} />} />
+      <SettingRow label="Follow original HTTP Method" description="Redirect with the original HTTP method instead of the default behavior of redirecting with GET." control={<Toggle checked={settings.followOriginalMethod} onChange={value => update({ followOriginalMethod: value })} />} />
+      <SettingRow label="Follow Authorization header" description="Retain authorization header when a redirect happens to a different hostname." control={<Toggle checked={settings.followAuthHeader} onChange={value => update({ followAuthHeader: value })} />} />
+      <SettingRow label="Remove referer header on redirect" description="Remove the referer header when a redirect happens." control={<Toggle checked={settings.removeRefererOnRedirect} onChange={value => update({ removeRefererOnRedirect: value })} />} />
+      <SettingRow label="Enable strict HTTP parser" description="Restrict responses with invalid HTTP headers." control={<Toggle checked={settings.strictHttpParser} onChange={value => update({ strictHttpParser: value })} />} />
+      <SettingRow label="Encode URL automatically" description="Encode the URL's path, query parameters, and authentication fields." control={<Toggle checked={settings.encodeUrlAutomatically} onChange={value => update({ encodeUrlAutomatically: value })} />} />
+      <SettingRow label="Disable cookie jar" description="Prevent cookies used in this request from being stored in the cookie jar. Existing cookies in the cookie jar will not be added as headers for this request." defaultText="Default: Settings" control={<Toggle checked={settings.disableCookieJar} onChange={value => update({ disableCookieJar: value })} />} />
+      <SettingRow label="Use server cipher suite during handshake" description="Use the server's cipher suite order instead of the client's during handshake." control={<Toggle checked={settings.useServerCipherSuite} onChange={value => update({ useServerCipherSuite: value })} />} />
+      <SettingRow label="Maximum number of redirects" description="Set a cap on the maximum number of redirects to follow." control={<input className="compact-number" type="number" min={0} value={settings.maxRedirects} onChange={event => update({ maxRedirects: Number(event.target.value) })} />} />
+    </div>
+  );
+}
+
+function SettingRow({ label, description, badge, defaultText, control }: { label: string; description: string; badge?: string; defaultText?: string; control: ReactNode }) {
+  return (
+    <div className="setting-row">
+      <div className="setting-copy">
+        <div className="setting-label">{label}{badge && <span className="badge-new">{badge}</span>}</div>
+        <p>{description}</p>
+      </div>
+      <div className="setting-control">
+        {control}
+        {defaultText && <small>{defaultText}</small>}
       </div>
     </div>
+  );
+}
+
+function Toggle({ checked, onChange }: { checked: boolean; onChange: (checked: boolean) => void }) {
+  return (
+    <button className={checked ? 'toggle-switch on' : 'toggle-switch'} onClick={() => onChange(!checked)} type="button">
+      <span />
+      <strong>{checked ? 'ON' : 'OFF'}</strong>
+    </button>
   );
 }
 
@@ -605,6 +827,10 @@ function EmptyState({ title }: { title: string }) {
 
 function updateHeader(headers: HeaderRow[], setHeaders: (headers: HeaderRow[]) => void, index: number, patch: Partial<HeaderRow>) {
   setHeaders(headers.map((header, idx) => idx === index ? { ...header, ...patch } : header));
+}
+
+function emptyRow(): HeaderRow {
+  return { id: crypto.randomUUID(), key: '', value: '', enabled: true };
 }
 
 function idleResult(): FileResult {

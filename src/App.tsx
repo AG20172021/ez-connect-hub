@@ -19,6 +19,7 @@ type Field = {
   type?: 'text' | 'password' | 'number';
   placeholder?: string;
   optional?: boolean;
+  help?: string;
 };
 
 type FileConnection = {
@@ -153,7 +154,13 @@ const fieldsByType: Record<ConnectorType, Field[]> = {
   azure: [
     { key: 'account', label: 'Storage Account Name', optional: true },
     { key: 'container', label: 'Container Name' },
-    { key: 'connectionString', label: 'Connection String or SAS URL', type: 'password', control: 'textarea' },
+    {
+      key: 'connectionString',
+      label: 'Connection String or SAS URL',
+      type: 'password',
+      control: 'textarea',
+      help: 'Profile export samples blob contents. Use a SAS or connection string that can read blobs, not only list the container.'
+    },
     { key: 'pathPrefix', label: 'Path Prefix', optional: true }
   ],
   sftp: [
@@ -628,30 +635,95 @@ function FilesPage({
   onUnauthorized: () => void;
 }) {
   const latestModified = selectedResult.files[0]?.modifiedAt;
-  const canDownloadCsv = selectedResult.status === 'success' && selectedResult.files.length > 0;
-  const [csvExporting, setCsvExporting] = useState(false);
+  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
+  const [fileProfiles, setFileProfiles] = useState<Record<string, FileProfile>>({});
+  const [profileBusy, setProfileBusy] = useState(false);
   const [csvExportMessage, setCsvExportMessage] = useState('');
+  const selectedFiles = selectedResult.files.filter(file => selectedPaths.has(file.path));
+  const canProfile = selectedResult.status === 'success' && selectedFiles.length > 0 && !profileBusy;
+  const selectedProfilesReady = selectedFiles.length > 0 && selectedFiles.every(file => fileProfiles[file.path]);
+  const allFilesSelected = selectedResult.files.length > 0 && selectedResult.files.every(file => selectedPaths.has(file.path));
+  const selectedProfileMap = new Map(selectedFiles.filter(file => fileProfiles[file.path]).map(file => [file.path, fileProfiles[file.path]]));
 
   useEffect(() => {
     setCsvExportMessage('');
-  }, [selectedId, selectedResult.status]);
+    if (selectedResult.status === 'success') {
+      const nextPaths = new Set(selectedResult.files.map(file => file.path));
+      setSelectedPaths(nextPaths);
+      setFileProfiles(current => Object.fromEntries(Object.entries(current).filter(([path]) => nextPaths.has(path))));
+    } else {
+      setSelectedPaths(new Set());
+      setFileProfiles({});
+    }
+  }, [selectedId, selectedResult.status, selectedResult.files]);
 
-  async function downloadInventoryCsv() {
-    if (!canDownloadCsv || csvExporting) return;
-    setCsvExporting(true);
-    setCsvExportMessage('Profiling file samples...');
+  function toggleFileSelection(path: string) {
+    setSelectedPaths(current => {
+      const next = new Set(current);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }
+
+  function toggleAllFiles() {
+    if (allFilesSelected) {
+      setSelectedPaths(new Set());
+    } else {
+      setSelectedPaths(new Set(selectedResult.files.map(file => file.path)));
+    }
+  }
+
+  async function profileSelectedFiles(message = 'Profiling selected file samples...') {
+    if (!selectedFiles.length) return new Map<string, FileProfile>();
+    setProfileBusy(true);
+    setCsvExportMessage(message);
 
     try {
+      const profiles = await profileFilesForCsv(appAuthToken, selectedSource, selectedFiles, onUnauthorized);
+      setFileProfiles(current => ({ ...current, ...Object.fromEntries(profiles) }));
+      const unprofiledCount = [...profiles.values()].filter(profile => !profile.profilingStatus.startsWith('profiled_')).length;
+      setCsvExportMessage(unprofiledCount ? `Profiled ${profiles.size - unprofiledCount}; ${unprofiledCount} need attention.` : `Profiled ${profiles.size} file${profiles.size === 1 ? '' : 's'}.`);
+      return profiles;
+    } catch (error) {
+      setCsvExportMessage(error instanceof Error ? error.message : 'Unable to profile selected files');
+      throw error;
+    } finally {
+      setProfileBusy(false);
+    }
+  }
+
+  async function ensureSelectedProfiles(message: string) {
+    const missingFiles = selectedFiles.filter(file => !fileProfiles[file.path]);
+    if (missingFiles.length === 0) return selectedProfileMap;
+    const profiles = await profileSelectedFiles(message);
+    return new Map([...selectedProfileMap, ...profiles]);
+  }
+
+  async function downloadInventoryCsv() {
+    if (!selectedFiles.length || profileBusy) return;
+    try {
       const source = selectedResult.source || sourceLocation(selectedSource);
-      const profiles = await profileFilesForCsv(appAuthToken, selectedSource, selectedResult.files, onUnauthorized);
-      const csv = buildInventoryCsv(selectedSource, selectedResult, source, profiles);
+      const profiles = await ensureSelectedProfiles('Profiling missing files before CSV export...');
+      const csv = buildInventoryCsv(selectedSource, { ...selectedResult, files: selectedFiles }, source, profiles);
       downloadTextFile(inventoryFileName(selectedSource), csv, 'text/csv;charset=utf-8');
       const unprofiledCount = [...profiles.values()].filter(profile => !profile.profilingStatus.startsWith('profiled_')).length;
       setCsvExportMessage(unprofiledCount ? `Downloaded with ${unprofiledCount} unprofiled file${unprofiledCount === 1 ? '' : 's'}.` : 'Downloaded profiled inventory CSV.');
-    } catch (error) {
-      setCsvExportMessage(error instanceof Error ? error.message : 'Unable to export profiled CSV');
-    } finally {
-      setCsvExporting(false);
+    } catch {
+      // profileSelectedFiles already set the visible error message.
+    }
+  }
+
+  async function downloadProfileConfig() {
+    if (!selectedFiles.length || profileBusy) return;
+    try {
+      const source = selectedResult.source || sourceLocation(selectedSource);
+      const profiles = await ensureSelectedProfiles('Profiling missing files before config export...');
+      const config = buildProfileConfig(selectedSource, { ...selectedResult, files: selectedFiles }, source, profiles);
+      downloadTextFile(profileConfigFileName(selectedSource), JSON.stringify(config, null, 2), 'application/json;charset=utf-8');
+      setCsvExportMessage('Downloaded reusable profile config.');
+    } catch {
+      // profileSelectedFiles already set the visible error message.
     }
   }
 
@@ -695,10 +767,6 @@ function FilesPage({
           <div><span className="eyebrow">File Visibility</span><h2>Source file inventory</h2></div>
           <div className="inventory-heading-actions">
             <span className="source-location">{selectedResult.source || sourceLocation(selectedSource)}</span>
-            <button className="secondary-action" disabled={!canDownloadCsv || csvExporting} onClick={() => void downloadInventoryCsv()}>
-              <Download size={15} />{csvExporting ? 'Profiling...' : 'Download CSV'}
-            </button>
-            {csvExportMessage && <span className="export-status">{csvExportMessage}</span>}
           </div>
         </div>
 
@@ -710,13 +778,47 @@ function FilesPage({
 
         {selectedResult.status === 'success' ? (
           <>
+            {selectedResult.files.length > 0 && (
+              <div className="profile-toolbar">
+                <div className="profile-toolbar-copy">
+                  <strong>{selectedFiles.length} selected</strong>
+                  <span>{selectedProfilesReady ? 'Profiles ready for export' : 'Profile selected files to preview schema and keys'}</span>
+                </div>
+                <div className="profile-toolbar-actions">
+                  <button className="secondary-action" disabled={!canProfile} onClick={() => void profileSelectedFiles()}>
+                    <RefreshCw size={15} />{profileBusy ? 'Profiling...' : 'Profile Selected'}
+                  </button>
+                  <button className="secondary-action" disabled={!selectedProfilesReady || profileBusy} onClick={() => void downloadInventoryCsv()}>
+                    <Download size={15} />Download CSV
+                  </button>
+                  <button className="secondary-action" disabled={!selectedProfilesReady || profileBusy} onClick={() => void downloadProfileConfig()}>
+                    <Settings size={15} />Export Config
+                  </button>
+                </div>
+                {selectedSource.type === 'azure' && (
+                  <div className="profile-notice">Azure profiling reads a small byte range from each blob. A SAS that can list the container but cannot read blob contents will export metadata with a not_profiled status.</div>
+                )}
+                {csvExportMessage && <div className="export-status">{csvExportMessage}</div>}
+              </div>
+            )}
             <div className="summary-grid">
               <SummaryItem icon={<FileText size={18} />} value={String(selectedResult.files.length)} label="Files found" />
               <SummaryItem icon={<HardDrive size={18} />} value={formatBytes(totalSize)} label="Total size" />
               <SummaryItem icon={<ShieldCheck size={18} />} value={selectedResult.files.every(file => file.encrypted) ? 'Encrypted' : 'Mixed'} label="Protection" />
               <SummaryItem icon={<RefreshCw size={18} />} value={latestModified ? formatDate(latestModified) : '-'} label="Latest update" />
             </div>
-            {selectedResult.files.length > 0 ? <FileTable files={selectedResult.files} /> : <EmptyState title="No files returned" />}
+            {selectedResult.files.length > 0 ? (
+              <>
+                <FileTable
+                  files={selectedResult.files}
+                  selectedPaths={selectedPaths}
+                  allSelected={allFilesSelected}
+                  onToggleAll={toggleAllFiles}
+                  onToggleFile={toggleFileSelection}
+                />
+                <ProfilePreview files={selectedFiles} profiles={fileProfiles} busy={profileBusy} />
+              </>
+            ) : <EmptyState title="No files returned" />}
           </>
         ) : (
           <EmptyState title={selectedResult.status === 'loading' ? 'Listing files...' : connectedSources.length ? selectedResult.message : 'No connected file sources'} />
@@ -726,14 +828,27 @@ function FilesPage({
   );
 }
 
-function FileTable({ files }: { files: FileMetadata[] }) {
+function FileTable({
+  files,
+  selectedPaths,
+  allSelected,
+  onToggleAll,
+  onToggleFile
+}: {
+  files: FileMetadata[];
+  selectedPaths: Set<string>;
+  allSelected: boolean;
+  onToggleAll: () => void;
+  onToggleFile: (path: string) => void;
+}) {
   return (
     <div className="table-wrap">
       <table>
-        <thead><tr><th>File</th><th>Type</th><th>Size</th><th>Modified</th><th>Owner</th><th>Storage</th><th>Rows</th></tr></thead>
+        <thead><tr><th className="select-col"><input aria-label="Select all files" checked={allSelected} onChange={onToggleAll} type="checkbox" /></th><th>File</th><th>Type</th><th>Size</th><th>Modified</th><th>Owner</th><th>Storage</th><th>Rows</th></tr></thead>
         <tbody>
           {files.map(file => (
             <tr key={file.id}>
+              <td className="select-col"><input aria-label={`Select ${file.name}`} checked={selectedPaths.has(file.path)} onChange={() => onToggleFile(file.path)} type="checkbox" /></td>
               <td><strong>{file.name}</strong><small>{file.path}</small></td>
               <td>{file.kind}</td>
               <td>{formatBytes(file.sizeBytes)}</td>
@@ -746,6 +861,41 @@ function FileTable({ files }: { files: FileMetadata[] }) {
         </tbody>
       </table>
     </div>
+  );
+}
+
+function ProfilePreview({ files, profiles, busy }: { files: FileMetadata[]; profiles: Record<string, FileProfile>; busy: boolean }) {
+  const rows = files.map(file => ({ file, profile: profiles[file.path] }));
+  const readyCount = rows.filter(row => row.profile).length;
+
+  return (
+    <section className="profile-preview">
+      <div className="profile-preview-heading">
+        <div><span className="eyebrow">Profile Preview</span><h3>Selected file profile</h3></div>
+        <span>{busy ? 'Profiling...' : `${readyCount}/${files.length} ready`}</span>
+      </div>
+      {files.length === 0 ? (
+        <EmptyState title="Select files to profile" />
+      ) : (
+        <div className="table-wrap">
+          <table className="profile-table">
+            <thead><tr><th>File</th><th>Status</th><th>Rows</th><th>Schema</th><th>Key</th><th>Nullable</th></tr></thead>
+            <tbody>
+              {rows.map(({ file, profile }) => (
+                <tr key={file.path}>
+                  <td><strong>{file.name}</strong><small>{file.kind}</small></td>
+                  <td>{profile ? profile.profilingStatus : 'pending_profile'}</td>
+                  <td>{profile ? String(profile.rowCount) : '-'}</td>
+                  <td>{profile ? schemaSummary(profile.sourceSchemaJson) : '-'}</td>
+                  <td>{profile?.primaryKeyCandidate || 'FALSE'}</td>
+                  <td>{profile ? String(profile.nullableColumnCount) : '-'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -1197,6 +1347,7 @@ function ConfigModal({
                     </div>
                   )
                   : <input type={field.type || 'text'} placeholder={field.placeholder || ''} value={config[field.key] || ''} onChange={event => onChange({ ...config, [field.key]: event.target.value })} />}
+                {field.help && <small className="field-help">{field.help}</small>}
               </label>
             );
           })}
@@ -1458,6 +1609,37 @@ function stringifyRecordValues(value: Record<string, unknown>) {
 
 class UnauthorizedError extends Error {}
 
+function buildProfileConfig(connection: FileConnection, result: FileResult, source: string, profiles = new Map<string, FileProfile>()) {
+  return {
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    source: {
+      name: connection.name,
+      type: connection.type,
+      location: source
+    },
+    files: result.files.map(file => {
+      const profile = profiles.get(file.path) || fileProfileError(file, 'not_profiled');
+      return {
+        source_name: fileNameToTableName(file.name),
+        source_path: file.path,
+        file_kind: file.kind,
+        source_schema: profile.sourceSchemaJson,
+        row_count: profile.rowCount,
+        primary_key_candidate: profile.primaryKeyCandidate,
+        identity_candidate: profile.identityCandidate,
+        nullable_column_count: profile.nullableColumnCount,
+        profiling_status: profile.profilingStatus,
+        databricks_target: {
+          table_name: fileNameToTableName(file.name),
+          schema: profile.sourceSchemaJson,
+          primary_key: profile.primaryKeyCandidate === 'FALSE' ? null : profile.primaryKeyCandidate.split(',')
+        }
+      };
+    })
+  };
+}
+
 function buildInventoryCsv(connection: FileConnection, result: FileResult, source: string, profiles = new Map<string, FileProfile>()) {
   const headers = [
     'source_name',
@@ -1527,6 +1709,24 @@ function inventoryFileName(connection: FileConnection) {
   const safeName = connection.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || connection.type;
   const date = new Date().toISOString().slice(0, 10);
   return `ez-connect-${safeName}-inventory-${date}.csv`;
+}
+
+function profileConfigFileName(connection: FileConnection) {
+  const safeName = connection.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || connection.type;
+  const date = new Date().toISOString().slice(0, 10);
+  return `ez-connect-${safeName}-profile-config-${date}.json`;
+}
+
+function fileNameToTableName(name: string) {
+  const withoutExt = name.replace(/\.[^.]+$/, '');
+  return (withoutExt || name).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/(^_+|_+$)/g, '') || 'source_table';
+}
+
+function schemaSummary(schema: Record<string, string>) {
+  const entries = Object.entries(schema);
+  if (!entries.length) return '{}';
+  const visible = entries.slice(0, 4).map(([name, type]) => `${name}: ${type}`);
+  return entries.length > 4 ? `${visible.join(', ')} +${entries.length - 4}` : visible.join(', ');
 }
 
 function dbStatusLabel(status: DbConnectionStatus) {

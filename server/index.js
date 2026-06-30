@@ -736,7 +736,7 @@ async function profileFile(payload) {
 
   const format = profileFormat(fileName || filePath, file.kind);
   if (!format) {
-    return profilePlaceholder(filePath, `unsupported_format_${statusToken(file.kind || fileKind(fileName || filePath))}`);
+    return profilePlaceholder(filePath, unsupportedProfileStatus(fileName || filePath, file.kind));
   }
 
   let sample;
@@ -806,6 +806,27 @@ function profileFormat(fileName, kind) {
 
 function normalizeContentType(value) {
   return String(value || '').split(';')[0].trim().toLowerCase();
+}
+
+function unsupportedProfileStatus(fileName, kind) {
+  const lowerName = String(fileName || '').toLowerCase();
+  const lowerKind = String(kind || '').toLowerCase();
+  const contentType = normalizeContentType(kind);
+
+  if (lowerName.endsWith('.parquet') || lowerKind === 'parquet' || contentType === 'application/vnd.apache.parquet') {
+    return 'not_profiled_parquet_schema_reader_not_available';
+  }
+
+  if (
+    lowerName.endsWith('.xlsx') ||
+    lowerName.endsWith('.xls') ||
+    ['xlsx', 'xls', 'excel'].includes(lowerKind) ||
+    ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/vnd.ms-excel'].includes(contentType)
+  ) {
+    return 'not_profiled_excel_workbook_parser_not_available';
+  }
+
+  return `unsupported_format_${statusToken(kind || fileKind(fileName))}`;
 }
 
 function profilePlaceholder(filePath, status) {

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
-import { Check, ChevronDown, Database, FileText, FolderOpen, Globe, HardDrive, LogOut, Plus, RefreshCw, Send, Settings, ShieldCheck, Trash2, X, Zap } from 'lucide-react';
+import { Check, ChevronDown, Database, Download, FileText, FolderOpen, Globe, HardDrive, LogOut, Plus, RefreshCw, Send, Settings, ShieldCheck, Trash2, X, Zap } from 'lucide-react';
 
 type Section = 'files' | 'database' | 'api';
 type ConnectorType = 's3' | 'gcs' | 'azure' | 'sftp' | 'local';
@@ -612,6 +612,14 @@ function FilesPage({
   onSelect: (id: string) => void;
 }) {
   const latestModified = selectedResult.files[0]?.modifiedAt;
+  const canDownloadCsv = selectedResult.status === 'success' && selectedResult.files.length > 0;
+
+  function downloadInventoryCsv() {
+    if (!canDownloadCsv) return;
+    const source = selectedResult.source || sourceLocation(selectedSource);
+    const csv = buildInventoryCsv(selectedSource, selectedResult, source);
+    downloadTextFile(inventoryFileName(selectedSource), csv, 'text/csv;charset=utf-8');
+  }
 
   return (
     <>
@@ -651,7 +659,12 @@ function FilesPage({
       <section className="inventory-panel">
         <div className="inventory-heading">
           <div><span className="eyebrow">File Visibility</span><h2>Source file inventory</h2></div>
-          <span className="source-location">{selectedResult.source || sourceLocation(selectedSource)}</span>
+          <div className="inventory-heading-actions">
+            <span className="source-location">{selectedResult.source || sourceLocation(selectedSource)}</span>
+            <button className="secondary-action" disabled={!canDownloadCsv} onClick={downloadInventoryCsv}>
+              <Download size={15} />Download CSV
+            </button>
+          </div>
         </div>
 
         {connectedSources.length > 0 && (
@@ -1307,6 +1320,74 @@ function sourceLocation(connection: FileConnection) {
     case 'sftp': return `${config.host || 'host'}:${config.baseDir || '/'}`;
     case 'local': return config.mountPath || '/mnt/source';
   }
+}
+
+function buildInventoryCsv(connection: FileConnection, result: FileResult, source: string) {
+  const headers = [
+    'source_name',
+    'source_type',
+    'source_location',
+    'file_name',
+    'file_path',
+    'file_kind',
+    'size_bytes',
+    'modified_at',
+    'owner',
+    'storage_class',
+    'encrypted',
+    'row_count',
+    'source_schema_json',
+    'primary_key_candidate',
+    'identity_candidate',
+    'nullable_column_count',
+    'profiling_status'
+  ];
+
+  const rows = result.files.map(file => [
+    connection.name,
+    connection.type,
+    source,
+    file.name,
+    file.path,
+    file.kind,
+    file.sizeBytes,
+    file.modifiedAt,
+    file.owner,
+    file.storageClass,
+    file.encrypted,
+    file.rows ?? '',
+    '',
+    '',
+    '',
+    '',
+    'metadata_only'
+  ]);
+
+  return [headers, ...rows].map(row => row.map(csvCell).join(',')).join('\r\n');
+}
+
+function csvCell(value: string | number | boolean | null | undefined) {
+  const text = value == null ? '' : String(value);
+  if (!/[",\r\n]/.test(text)) return text;
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function downloadTextFile(fileName: string, content: string, type: string) {
+  const blob = new Blob(['\uFEFF', content], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function inventoryFileName(connection: FileConnection) {
+  const safeName = connection.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || connection.type;
+  const date = new Date().toISOString().slice(0, 10);
+  return `ez-connect-${safeName}-inventory-${date}.csv`;
 }
 
 function dbStatusLabel(status: DbConnectionStatus) {

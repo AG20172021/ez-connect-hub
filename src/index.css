@@ -316,6 +316,14 @@ button:disabled {
   font-size: 18px;
 }
 
+.inventory-heading-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  min-width: 0;
+}
+
 .eyebrow {
   display: block;
   color: var(--blue);
@@ -326,7 +334,7 @@ button:disabled {
 }
 
 .source-location {
-  max-width: 45%;
+  max-width: min(520px, 45vw);
   color: var(--gray-500);
   font-size: 12px;
   overflow-wrap: anywhere;
@@ -946,6 +954,7 @@ td small {
 
 @media (max-width: 600px) {
   .section-header, .inventory-heading, .modal footer { align-items: stretch; flex-direction: column; }
+  .inventory-heading-actions { align-items: stretch; flex-direction: column; }
   .source-location { max-width: none; text-align: left; }
   .summary-grid, .connector-grid { grid-template-columns: 1fr; }
   .request-line { grid-template-columns: 1fr; }

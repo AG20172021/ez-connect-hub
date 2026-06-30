@@ -529,7 +529,7 @@ td small {
 .auth-section {
   display: grid;
   gap: 16px;
-  max-width: 520px;
+  max-width: 760px;
 }
 
 .auth-type-field {
@@ -557,8 +557,7 @@ td small {
 
 .select-chevron {
   color: var(--gray-500);
-  font-size: 16px;
-  line-height: 1;
+  flex: 0 0 auto;
 }
 
 .auth-menu {
@@ -592,10 +591,47 @@ td small {
   background: var(--gray-100);
 }
 
+.api-key-block {
+  display: grid;
+  gap: 12px;
+}
+
 .api-key-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(140px, 1fr) minmax(220px, 1.2fr) minmax(150px, .8fr);
   gap: 12px;
+}
+
+.api-key-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.api-key-actions span {
+  color: var(--gray-500);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.url-preview {
+  display: grid;
+  gap: 4px;
+  margin: 0 20px 18px;
+  padding: 10px 12px;
+  border: 1px solid var(--gray-200);
+  border-radius: 6px;
+  background: var(--gray-50);
+  color: var(--gray-700);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.url-preview strong {
+  color: var(--gray-900);
+  font-size: 12px;
 }
 
 .kv-header {
@@ -802,6 +838,7 @@ td small {
   .request-line { grid-template-columns: 1fr; }
   .api-tabs { overflow-x: auto; padding: 0 12px; }
   .auth-section, .kv-table, .body-editor, .api-settings-panel { padding: 16px 14px; }
+  .url-preview { margin: 0 14px 16px; }
   .kv-header { display: none; }
   .kv-row { grid-template-columns: 24px 1fr 32px; }
   .kv-row input:nth-of-type(3) { grid-column: 2 / 4; }

@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Check, Database, FileText, FolderOpen, Globe, HardDrive, Plus, RefreshCw, Send, Settings, ShieldCheck, Trash2, X, Zap } from 'lucide-react';
+import { Check, ChevronDown, Database, FileText, FolderOpen, Globe, HardDrive, Plus, RefreshCw, Send, Settings, ShieldCheck, Trash2, X, Zap } from 'lucide-react';
 
 type Section = 'files' | 'database' | 'api';
 type ConnectorType = 's3' | 'gcs' | 'azure' | 'sftp' | 'local';
@@ -9,6 +9,7 @@ type RequestMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD';
 type ApiTab = 'params' | 'authorization' | 'headers' | 'body' | 'settings';
 type AuthType = 'No Auth' | 'Basic Auth' | 'Bearer Token' | 'JWT Bearer' | 'Digest Auth' | 'OAuth 1.0' | 'OAuth 2.0' | 'Hawk Authentication' | 'AWS Signature' | 'NTLM Authentication' | 'API Key' | 'Akamai EdgeGrid' | 'ASAP (Atlassian)';
 type Transport = 'browser' | 'server';
+type ApiKeyTarget = 'query' | 'header';
 
 type Field = {
   key: string;
@@ -480,8 +481,9 @@ function ApiPage() {
   const [authType, setAuthType] = useState<AuthType>('OAuth 2.0');
   const [authDropdownOpen, setAuthDropdownOpen] = useState(false);
   const [authToken, setAuthToken] = useState('');
-  const [apiKeyName, setApiKeyName] = useState('api_key');
+  const [apiKeyName, setApiKeyName] = useState('appid');
   const [apiKeyValue, setApiKeyValue] = useState('');
+  const [apiKeyTarget, setApiKeyTarget] = useState<ApiKeyTarget>('query');
   const [transport, setTransport] = useState<Transport>('browser');
   const [settings, setSettings] = useState<ApiSettings>(defaultApiSettings);
   const [sending, setSending] = useState(false);
@@ -495,25 +497,32 @@ function ApiPage() {
     if (['Bearer Token', 'JWT Bearer', 'OAuth 2.0'].includes(authType) && authToken.trim()) {
       next.Authorization = `Bearer ${authToken.trim()}`;
     }
-    if (authType === 'API Key' && apiKeyValue.trim() && apiKeyName.trim()) {
+    if (authType === 'API Key' && apiKeyTarget === 'header' && apiKeyValue.trim() && apiKeyName.trim()) {
       next[apiKeyName.trim()] = apiKeyValue.trim();
     }
     return next;
-  }, [apiKeyName, apiKeyValue, authToken, authType, headers]);
+  }, [apiKeyName, apiKeyTarget, apiKeyValue, authToken, authType, headers]);
 
   const requestUrl = useMemo(() => {
-    const enabledParams = params.filter(param => param.enabled && param.key.trim());
-    if (enabledParams.length === 0) return url;
+    return buildRequestUrl(url, params, authType === 'API Key' && apiKeyTarget === 'query' ? { key: apiKeyName, value: apiKeyValue } : undefined);
+  }, [apiKeyName, apiKeyTarget, apiKeyValue, authType, params, url]);
 
-    try {
-      const next = new URL(url);
-      enabledParams.forEach(param => next.searchParams.set(param.key.trim(), param.value));
-      return next.toString();
-    } catch {
-      const separator = url.includes('?') ? '&' : '?';
-      return `${url}${separator}${enabledParams.map(param => `${encodeURIComponent(param.key.trim())}=${encodeURIComponent(param.value)}`).join('&')}`;
+  function handleUrlInput(value: string) {
+    const parsed = splitUrlParams(value);
+    setUrl(parsed.baseUrl);
+    setParams(parsed.params);
+  }
+
+  function syncApiKey() {
+    if (!apiKeyName.trim()) return;
+    if (apiKeyTarget === 'query') {
+      setParams(current => upsertRow(current, apiKeyName.trim(), apiKeyValue));
+      setActiveTab('params');
+    } else {
+      setHeaders(current => upsertRow(current, apiKeyName.trim(), apiKeyValue));
+      setActiveTab('headers');
     }
-  }, [params, url]);
+  }
 
   async function sendRequest() {
     setSending(true);
@@ -564,7 +573,7 @@ function ApiPage() {
         <select className="method-select" value={method} onChange={event => setMethod(event.target.value as RequestMethod)}>
           {methods.map(option => <option key={option} value={option}>{option}</option>)}
         </select>
-        <input value={url} onChange={event => setUrl(event.target.value)} placeholder="https://api.example.com/resource" />
+        <input value={requestUrl} onChange={event => handleUrlInput(event.target.value)} placeholder="https://api.example.com/resource" />
         <button className="primary-action" disabled={sending || !url.trim()} onClick={() => void sendRequest()}><Send size={15} />{sending ? 'Sending...' : 'Send'}</button>
       </header>
 
@@ -578,15 +587,21 @@ function ApiPage() {
         </div>
 
         {activeTab === 'params' && (
-          <KeyValueEditor
-            addLabel="Add Parameter"
-            keyPlaceholder="Key"
-            rows={params}
-            valuePlaceholder="Value"
-            onAdd={() => setParams([...params, emptyRow()])}
-            onChange={(index, patch) => updateHeader(params, setParams, index, patch)}
-            onRemove={id => setParams(params.filter(item => item.id !== id))}
-          />
+          <>
+            <KeyValueEditor
+              addLabel="Add Parameter"
+              keyPlaceholder="Key"
+              rows={params}
+              valuePlaceholder="Value"
+              onAdd={() => setParams([...params, emptyRow()])}
+              onChange={(index, patch) => updateHeader(params, setParams, index, patch)}
+              onRemove={id => setParams(params.filter(item => item.id !== id))}
+            />
+            <div className="url-preview">
+              <strong>URL Preview</strong>
+              <span>{requestUrl || 'Add a request URL above.'}</span>
+            </div>
+          </>
         )}
 
         {activeTab === 'authorization' && (
@@ -595,13 +610,13 @@ function ApiPage() {
               <div className="auth-select">
                 <button type="button" onClick={() => setAuthDropdownOpen(!authDropdownOpen)}>
                   <span>{authType}</span>
-                  <span className="select-chevron">⌄</span>
+                  <ChevronDown className="select-chevron" size={14} />
                 </button>
                 {authDropdownOpen && (
                   <div className="auth-menu">
                     {authTypes.map(option => (
                       <button key={option} className={authType === option ? 'selected' : ''} onClick={() => { setAuthType(option); setAuthDropdownOpen(false); }}>
-                        <span>{authType === option ? '✓' : ''}</span>
+                        <span>{authType === option ? <Check size={13} /> : null}</span>
                         {option}
                       </button>
                     ))}
@@ -615,9 +630,23 @@ function ApiPage() {
             )}
 
             {authType === 'API Key' && (
-              <div className="api-key-grid">
-                <label className="form-field">Key<input value={apiKeyName} onChange={event => setApiKeyName(event.target.value)} /></label>
-                <label className="form-field">Value<input type="password" value={apiKeyValue} onChange={event => setApiKeyValue(event.target.value)} /></label>
+              <div className="api-key-block">
+                <div className="api-key-grid">
+                  <label className="form-field">Key<input value={apiKeyName} onChange={event => setApiKeyName(event.target.value)} placeholder="appid" /></label>
+                  <label className="form-field">Value<input type="password" value={apiKeyValue} onChange={event => setApiKeyValue(event.target.value)} placeholder="Your API key" /></label>
+                  <label className="form-field">Add to
+                    <select value={apiKeyTarget} onChange={event => setApiKeyTarget(event.target.value as ApiKeyTarget)}>
+                      <option value="query">Query Params</option>
+                      <option value="header">Headers</option>
+                    </select>
+                  </label>
+                </div>
+                <div className="api-key-actions">
+                  <button className="secondary-action" onClick={syncApiKey}>
+                    {apiKeyTarget === 'query' ? 'Sync to Params' : 'Sync to Headers'}
+                  </button>
+                  <span>{apiKeyTarget === 'query' ? 'The request URL will include this key as a query parameter.' : 'The request will include this key as a header.'}</span>
+                </div>
               </div>
             )}
 
@@ -831,6 +860,71 @@ function updateHeader(headers: HeaderRow[], setHeaders: (headers: HeaderRow[]) =
 
 function emptyRow(): HeaderRow {
   return { id: crypto.randomUUID(), key: '', value: '', enabled: true };
+}
+
+function buildRequestUrl(baseUrl: string, rows: HeaderRow[], apiKey?: { key: string; value: string }) {
+  const queryRows = rows.filter(row => row.enabled && row.key.trim());
+  if (apiKey?.key.trim() && apiKey.value.trim()) {
+    const key = apiKey.key.trim();
+    const existingIndex = queryRows.findIndex(row => row.key.trim().toLowerCase() === key.toLowerCase());
+    const nextRow = { id: 'authorization-api-key', key, value: apiKey.value, enabled: true };
+    if (existingIndex === -1) {
+      queryRows.push(nextRow);
+    } else {
+      queryRows[existingIndex] = nextRow;
+    }
+  }
+
+  if (queryRows.length === 0) return baseUrl;
+
+  try {
+    const next = new URL(baseUrl);
+    queryRows.forEach(row => next.searchParams.set(row.key.trim(), row.value));
+    return next.toString();
+  } catch {
+    const [rawBase, rawQuery = ''] = baseUrl.split('?');
+    const next = new URLSearchParams(rawQuery);
+    queryRows.forEach(row => next.set(row.key.trim(), row.value));
+    const query = next.toString();
+    return query ? `${rawBase}?${query}` : rawBase;
+  }
+}
+
+function splitUrlParams(value: string) {
+  try {
+    const parsed = new URL(value);
+    const params = Array.from(parsed.searchParams.entries()).map(([key, paramValue]) => ({
+      id: crypto.randomUUID(),
+      key,
+      value: paramValue,
+      enabled: true
+    }));
+    parsed.search = '';
+    return { baseUrl: parsed.toString(), params };
+  } catch {
+    const queryStart = value.indexOf('?');
+    if (queryStart === -1) return { baseUrl: value, params: [] };
+
+    const rawBase = value.slice(0, queryStart);
+    const rawQuery = value.slice(queryStart + 1);
+    const params = Array.from(new URLSearchParams(rawQuery).entries()).map(([key, paramValue]) => ({
+      id: crypto.randomUUID(),
+      key,
+      value: paramValue,
+      enabled: true
+    }));
+    return { baseUrl: rawBase, params };
+  }
+}
+
+function upsertRow(rows: HeaderRow[], key: string, value: string) {
+  const normalizedKey = key.trim().toLowerCase();
+  const existingIndex = rows.findIndex(row => row.key.trim().toLowerCase() === normalizedKey);
+  if (existingIndex === -1) {
+    return [...rows, { id: crypto.randomUUID(), key, value, enabled: true }];
+  }
+
+  return rows.map((row, index) => index === existingIndex ? { ...row, key, value, enabled: true } : row);
 }
 
 function idleResult(): FileResult {

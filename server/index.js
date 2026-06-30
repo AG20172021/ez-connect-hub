@@ -9,12 +9,14 @@ const staticRoot = path.resolve(__dirname, '../dist');
 const port = Number(process.env.PORT || 80);
 const maxBodyBytes = 1024 * 1024;
 const maxResponseBytes = 1024 * 1024;
+const profileSampleBytes = 256 * 1024;
+const profileMaxRows = 500;
 const authRequired = process.env.EZ_CONNECT_AUTH_DISABLED !== 'true';
 const authPassword = String(process.env.EZ_CONNECT_AUTH_PASSWORD || '');
 const authSecret = String(process.env.EZ_CONNECT_AUTH_SECRET || authPassword || '');
 const configuredAuthTtlSeconds = Number(process.env.EZ_CONNECT_AUTH_TTL_SECONDS || 12 * 60 * 60);
 const authTokenTtlSeconds = Number.isFinite(configuredAuthTtlSeconds) ? Math.max(configuredAuthTtlSeconds, 5 * 60) : 12 * 60 * 60;
-const protectedApiRoutes = new Set(['/api/files/list', '/api/database/test', '/api/http/request']);
+const protectedApiRoutes = new Set(['/api/files/list', '/api/files/profile', '/api/database/test', '/api/http/request']);
 const loginWindowMs = 15 * 60 * 1000;
 const maxFailedLogins = 10;
 const failedLoginAttempts = new Map();
@@ -77,6 +79,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/files/list') {
       const payload = await readJson(req);
       const result = await listFiles(payload);
+      sendJson(res, 200, result);
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/files/profile') {
+      const payload = await readJson(req);
+      const result = await profileFile(payload);
       sendJson(res, 200, result);
       return;
     }
@@ -714,6 +723,440 @@ async function getGcsToken(serviceAccount) {
   const body = await response.json();
   if (!response.ok) throw new AppError(502, `GCS auth failed: ${body.error_description || body.error || response.status}`);
   return body.access_token;
+}
+
+async function profileFile(payload) {
+  const type = String(payload?.type || '');
+  const config = payload?.config || {};
+  const file = payload?.file || {};
+  const filePath = String(file.path || '').trim();
+  const fileName = String(file.name || path.posix.basename(filePath)).trim();
+
+  if (!filePath) throw new AppError(400, 'File path is required for profiling');
+
+  const format = profileFormat(fileName || filePath, file.kind);
+  if (!format) {
+    return profilePlaceholder(filePath, `unsupported_format_${String(file.kind || fileKind(fileName || filePath)).toLowerCase()}`);
+  }
+
+  const sample = await readProfileSample(type, config, filePath);
+  if (looksBinary(sample)) return profilePlaceholder(filePath, 'unsupported_binary_sample');
+
+  const parsed = parseProfileSample(sample, format);
+  if (!parsed.rows.length) {
+    return {
+      filePath,
+      rowCount: 0,
+      sourceSchemaJson: {},
+      primaryKeyCandidate: 'none',
+      identityCandidate: false,
+      nullableColumnCount: 0,
+      profilingStatus: 'profiled_no_rows'
+    };
+  }
+
+  return {
+    filePath,
+    ...inferProfile(parsed.columns, parsed.rows, format.label)
+  };
+}
+
+function profileFormat(fileName, kind) {
+  const lowerName = String(fileName || '').toLowerCase();
+  const lowerKind = String(kind || '').toLowerCase();
+
+  if (lowerName.endsWith('.jsonl') || lowerName.endsWith('.ndjson') || ['jsonl', 'ndjson'].includes(lowerKind)) {
+    return { type: 'jsonl', label: 'jsonl' };
+  }
+
+  if (lowerName.endsWith('.json') || lowerKind === 'json') {
+    return { type: 'json', label: 'json' };
+  }
+
+  if (lowerName.endsWith('.tsv') || lowerKind === 'tsv') {
+    return { type: 'delimited', label: 'tsv', delimiter: '\t' };
+  }
+
+  if (lowerName.endsWith('.csv') || lowerKind === 'csv') {
+    return { type: 'delimited', label: 'csv', delimiter: ',' };
+  }
+
+  if (lowerName.endsWith('.txt') || lowerKind === 'txt') {
+    return { type: 'delimited', label: 'delimited' };
+  }
+
+  return null;
+}
+
+function profilePlaceholder(filePath, status) {
+  return {
+    filePath,
+    rowCount: 'not_profiled',
+    sourceSchemaJson: {},
+    primaryKeyCandidate: 'none',
+    identityCandidate: false,
+    nullableColumnCount: 'not_profiled',
+    profilingStatus: status
+  };
+}
+
+async function readProfileSample(type, config, filePath) {
+  switch (type) {
+    case 'azure':
+      return readAzureSample(config, filePath);
+    case 's3':
+      return readS3Sample(config, filePath);
+    case 'gcs':
+      return readGcsSample(config, filePath);
+    case 'sftp':
+      throw new AppError(501, 'SFTP profiling is not enabled in this deployment yet.');
+    case 'local':
+      throw new AppError(501, 'Local/NFS profiling is not enabled in this deployment yet.');
+    default:
+      throw new AppError(400, 'Unsupported file source type');
+  }
+}
+
+async function readAzureSample(config, filePath) {
+  const details = parseAzureConfig(config);
+  const target = parseAzurePath(filePath);
+  if (!target.blobName) throw new AppError(400, 'Azure blob path is required for profiling');
+  if (target.accountName && target.accountName.toLowerCase() !== details.accountName.toLowerCase()) {
+    throw new AppError(400, 'Azure blob path does not match the configured storage account');
+  }
+  if (target.container.toLowerCase() !== details.container.toLowerCase()) {
+    throw new AppError(400, 'Azure blob path does not match the configured container');
+  }
+
+  const url = new URL(`${details.endpoint.replace(/\/$/, '')}/${encodeURIComponent(details.container)}/${encodePathSegments(target.blobName)}`);
+  if (details.sas) appendSas(url, details.sas);
+
+  const headers = {
+    'x-ms-range': sampleRangeHeader(),
+    'x-ms-version': '2020-10-02'
+  };
+
+  if (details.accountKey && !details.sas) {
+    headers['x-ms-date'] = new Date().toUTCString();
+    headers.Authorization = azureSharedKey('GET', url, details.accountName, details.accountKey, headers);
+  }
+
+  return fetchSampleText(url, headers, 'Azure Blob');
+}
+
+async function readS3Sample(config, filePath) {
+  const accessKey = String(config.accessKey || '').trim();
+  const secretKey = String(config.secretKey || '').trim();
+  const region = String(config.region || 'us-east-1').trim();
+  const bucket = String(config.bucket || '').trim();
+  const endpoint = String(config.endpoint || '').replace(/\/$/, '');
+  const target = parseBucketPath(filePath, 's3');
+
+  if (!accessKey || !secretKey || !region || !bucket) throw new AppError(400, 'S3 region, bucket, access key, and secret key are required');
+  if (target.bucket !== bucket) throw new AppError(400, 'S3 object path does not match the configured bucket');
+  if (!target.key) throw new AppError(400, 'S3 object key is required for profiling');
+
+  const url = endpoint
+    ? new URL(`${endpoint}/${encodeURIComponent(bucket)}/${encodePathSegments(target.key)}`)
+    : new URL(`https://${bucket}.s3.${region}.amazonaws.com/${encodePathSegments(target.key)}`);
+  const headers = {
+    ...signS3Request(url, region, accessKey, secretKey),
+    Range: sampleRangeHeader()
+  };
+
+  return fetchSampleText(url, headers, 'S3 object');
+}
+
+async function readGcsSample(config, filePath) {
+  const bucket = String(config.bucket || '').trim();
+  const projectId = String(config.projectId || '').trim();
+  const serviceAccountText = String(config.serviceAccount || '').trim();
+  const target = parseBucketPath(filePath, 'gs');
+
+  if (!bucket || !projectId || !serviceAccountText) throw new AppError(400, 'GCS project, bucket, and service account JSON are required');
+  if (target.bucket !== bucket) throw new AppError(400, 'GCS object path does not match the configured bucket');
+  if (!target.key) throw new AppError(400, 'GCS object name is required for profiling');
+
+  let serviceAccount;
+  try {
+    serviceAccount = JSON.parse(serviceAccountText);
+  } catch {
+    throw new AppError(400, 'GCS service account JSON must be valid JSON');
+  }
+
+  const token = await getGcsToken(serviceAccount);
+  const url = new URL(`https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o/${encodeURIComponent(target.key)}`);
+  url.searchParams.set('alt', 'media');
+
+  return fetchSampleText(url, {
+    Authorization: `Bearer ${token}`,
+    Range: sampleRangeHeader()
+  }, 'GCS object');
+}
+
+async function fetchSampleText(url, headers, label) {
+  const response = await fetch(url, { headers });
+  const text = await limitedText(response);
+  if (!response.ok) throw new AppError(502, `${label} returned ${response.status}: ${text.slice(0, 300)}`);
+  return text.slice(0, profileSampleBytes);
+}
+
+function parseBucketPath(filePath, scheme) {
+  const prefix = `${scheme}://`;
+  if (!String(filePath).startsWith(prefix)) throw new AppError(400, `Expected ${scheme}:// path for profiling`);
+  const rest = String(filePath).slice(prefix.length);
+  const slashIndex = rest.indexOf('/');
+  const bucket = slashIndex === -1 ? rest : rest.slice(0, slashIndex);
+  const key = slashIndex === -1 ? '' : rest.slice(slashIndex + 1);
+
+  return {
+    bucket,
+    key: safeDecode(key)
+  };
+}
+
+function parseAzurePath(filePath) {
+  const prefix = 'azure://';
+  if (!String(filePath).startsWith(prefix)) throw new AppError(400, 'Expected azure:// path for profiling');
+  const rest = String(filePath).slice(prefix.length);
+  const parts = rest.split('/');
+
+  return {
+    accountName: parts[0] || '',
+    container: safeDecode(parts[1] || ''),
+    blobName: safeDecode(parts.slice(2).join('/'))
+  };
+}
+
+function safeDecode(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function encodePathSegments(value) {
+  return String(value).split('/').map(segment => encodeURIComponent(segment)).join('/');
+}
+
+function sampleRangeHeader() {
+  return `bytes=0-${profileSampleBytes - 1}`;
+}
+
+function looksBinary(text) {
+  return /\u0000/.test(text.slice(0, 4096));
+}
+
+function parseProfileSample(text, format) {
+  if (format.type === 'json') {
+    return parseJsonSample(text);
+  }
+  if (format.type === 'jsonl') {
+    return parseJsonLines(text);
+  }
+  return parseDelimitedSample(text, format);
+}
+
+function parseDelimitedSample(text, format) {
+  const normalized = stripBom(text);
+  const lines = normalized.split(/\r?\n/).filter(line => line.trim());
+  if (normalized.length >= profileSampleBytes && !normalized.endsWith('\n') && lines.length > 1) lines.pop();
+  if (!lines.length) return { columns: [], rows: [] };
+
+  const delimiter = format.delimiter || detectDelimiter(lines[0]);
+  const columns = uniqueColumns(parseDelimitedLine(lines[0], delimiter));
+  const rows = lines.slice(1, profileMaxRows + 1).map(line => {
+    const values = parseDelimitedLine(line, delimiter);
+    return Object.fromEntries(columns.map((column, index) => [column, values[index] ?? '']));
+  });
+
+  return { columns, rows };
+}
+
+function parseDelimitedLine(line, delimiter) {
+  const cells = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    const next = line[index + 1];
+    if (char === '"') {
+      if (inQuotes && next === '"') {
+        current += '"';
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (char === delimiter && !inQuotes) {
+      cells.push(current.trim());
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+
+  cells.push(current.trim());
+  return cells;
+}
+
+function detectDelimiter(line) {
+  const candidates = [',', '\t', '|', ';'];
+  return candidates
+    .map(delimiter => ({ delimiter, count: parseDelimitedLine(line, delimiter).length }))
+    .sort((a, b) => b.count - a.count)[0].delimiter;
+}
+
+function parseJsonSample(text) {
+  const normalized = stripBom(text).trim();
+  try {
+    const value = JSON.parse(normalized);
+    const rows = jsonRows(value).slice(0, profileMaxRows);
+    return { columns: jsonColumns(rows), rows };
+  } catch {
+    return parseJsonLines(text);
+  }
+}
+
+function parseJsonLines(text) {
+  const normalized = stripBom(text);
+  const lines = normalized.split(/\r?\n/).filter(line => line.trim());
+  if (normalized.length >= profileSampleBytes && !normalized.endsWith('\n') && lines.length > 1) lines.pop();
+
+  const rows = [];
+  for (const line of lines) {
+    if (rows.length >= profileMaxRows) break;
+    try {
+      const value = JSON.parse(line);
+      if (isPlainObject(value)) rows.push(value);
+    } catch {
+      // Ignore malformed trailing sample lines and keep rows already parsed.
+    }
+  }
+
+  return { columns: jsonColumns(rows), rows };
+}
+
+function jsonRows(value) {
+  if (Array.isArray(value)) return value.filter(isPlainObject);
+  if (!isPlainObject(value)) return [];
+
+  const nestedRows = Object.values(value).find(item => Array.isArray(item) && item.some(isPlainObject));
+  if (nestedRows) return nestedRows.filter(isPlainObject);
+  return [value];
+}
+
+function jsonColumns(rows) {
+  return uniqueColumns([...new Set(rows.flatMap(row => Object.keys(row)))]);
+}
+
+function uniqueColumns(columns) {
+  const seen = new Map();
+  return columns.map((column, index) => {
+    const base = String(column || '').trim() || `column_${index + 1}`;
+    const count = (seen.get(base.toLowerCase()) || 0) + 1;
+    seen.set(base.toLowerCase(), count);
+    return count === 1 ? base : `${base}_${count}`;
+  });
+}
+
+function inferProfile(columns, rows, formatLabel) {
+  const stats = columns.map(column => columnStats(column, rows));
+  const sourceSchemaJson = Object.fromEntries(stats.map(stat => [stat.name, inferDatabricksType(stat.nonNullValues)]));
+  const nullableColumnCount = stats.filter(stat => stat.nullCount > 0).length;
+  const primaryKey = choosePrimaryKey(stats, rows.length);
+
+  return {
+    rowCount: rows.length,
+    sourceSchemaJson,
+    primaryKeyCandidate: primaryKey?.name || 'none',
+    identityCandidate: Boolean(primaryKey && isIdentityCandidate(primaryKey)),
+    nullableColumnCount,
+    profilingStatus: `profiled_${formatLabel}_sample_rows_${rows.length}`
+  };
+}
+
+function columnStats(column, rows) {
+  const values = rows.map(row => row[column]);
+  const nonNullValues = values.filter(value => !isNullLike(value));
+  return {
+    name: column,
+    nullCount: values.length - nonNullValues.length,
+    nonNullValues,
+    distinctCount: new Set(nonNullValues.map(value => String(value))).size,
+    type: inferDatabricksType(nonNullValues)
+  };
+}
+
+function choosePrimaryKey(stats, rowCount) {
+  const candidates = stats.filter(stat => rowCount > 0 && stat.nullCount === 0 && stat.distinctCount === rowCount);
+  return candidates.sort((a, b) => keyScore(b) - keyScore(a))[0];
+}
+
+function keyScore(stat) {
+  const name = stat.name.toLowerCase();
+  let score = 0;
+  if (name === 'id') score += 8;
+  if (name.endsWith('_id') || name.endsWith(' id')) score += 6;
+  if (name.includes('key')) score += 4;
+  if (name.includes('identifier')) score += 4;
+  if (stat.type === 'BIGINT') score += 2;
+  return score;
+}
+
+function isIdentityCandidate(stat) {
+  const name = stat.name.toLowerCase();
+  return stat.type === 'BIGINT' && (name === 'id' || name.endsWith('_id') || name.includes('key'));
+}
+
+function inferDatabricksType(values) {
+  if (!values.length) return 'STRING';
+  if (values.every(isBooleanLike)) return 'BOOLEAN';
+  if (values.every(isIntegerLike)) return 'BIGINT';
+  if (values.every(isNumberLike)) return 'DOUBLE';
+  if (values.every(isDateLike)) return 'DATE';
+  if (values.every(isTimestampLike)) return 'TIMESTAMP';
+  return 'STRING';
+}
+
+function isNullLike(value) {
+  if (value == null) return true;
+  const text = String(value).trim().toLowerCase();
+  return text === '' || text === 'null' || text === 'undefined';
+}
+
+function isBooleanLike(value) {
+  if (typeof value === 'boolean') return true;
+  return /^(true|false)$/i.test(String(value).trim());
+}
+
+function isIntegerLike(value) {
+  if (typeof value === 'number') return Number.isSafeInteger(value);
+  return /^[-+]?\d+$/.test(String(value).trim());
+}
+
+function isNumberLike(value) {
+  if (typeof value === 'number') return Number.isFinite(value);
+  return /^[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(String(value).trim());
+}
+
+function isDateLike(value) {
+  const text = String(value).trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) && !Number.isNaN(Date.parse(`${text}T00:00:00Z`));
+}
+
+function isTimestampLike(value) {
+  const text = String(value).trim();
+  return /^\d{4}-\d{2}-\d{2}[T\s]/.test(text) && !Number.isNaN(Date.parse(text));
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function stripBom(text) {
+  return text.replace(/^\uFEFF/, '');
 }
 
 async function proxyHttpRequest(payload) {

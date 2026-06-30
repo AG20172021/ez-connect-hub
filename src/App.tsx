@@ -65,6 +65,16 @@ type FileResult = {
   source?: string;
 };
 
+type FileProfile = {
+  filePath: string;
+  rowCount: number | string;
+  sourceSchemaJson: Record<string, string>;
+  primaryKeyCandidate: string;
+  identityCandidate: boolean;
+  nullableColumnCount: number | string;
+  profilingStatus: string;
+};
+
 type HeaderRow = {
   id: string;
   key: string;
@@ -496,6 +506,8 @@ function App() {
             onConfigure={openFileEditor}
             onRefresh={refreshSelectedSource}
             onSelect={setSelectedId}
+            appAuthToken={appAuthToken}
+            onUnauthorized={handleUnauthorized}
           />
         )}
 
@@ -598,7 +610,9 @@ function FilesPage({
   totalSize,
   onConfigure,
   onRefresh,
-  onSelect
+  onSelect,
+  appAuthToken,
+  onUnauthorized
 }: {
   connections: FileConnection[];
   connectedSources: FileConnection[];
@@ -610,15 +624,35 @@ function FilesPage({
   onConfigure: (connection: FileConnection) => void;
   onRefresh: () => void;
   onSelect: (id: string) => void;
+  appAuthToken: string;
+  onUnauthorized: () => void;
 }) {
   const latestModified = selectedResult.files[0]?.modifiedAt;
   const canDownloadCsv = selectedResult.status === 'success' && selectedResult.files.length > 0;
+  const [csvExporting, setCsvExporting] = useState(false);
+  const [csvExportMessage, setCsvExportMessage] = useState('');
 
-  function downloadInventoryCsv() {
-    if (!canDownloadCsv) return;
-    const source = selectedResult.source || sourceLocation(selectedSource);
-    const csv = buildInventoryCsv(selectedSource, selectedResult, source);
-    downloadTextFile(inventoryFileName(selectedSource), csv, 'text/csv;charset=utf-8');
+  useEffect(() => {
+    setCsvExportMessage('');
+  }, [selectedId, selectedResult.status]);
+
+  async function downloadInventoryCsv() {
+    if (!canDownloadCsv || csvExporting) return;
+    setCsvExporting(true);
+    setCsvExportMessage('Profiling file samples...');
+
+    try {
+      const source = selectedResult.source || sourceLocation(selectedSource);
+      const profiles = await profileFilesForCsv(appAuthToken, selectedSource, selectedResult.files, onUnauthorized);
+      const csv = buildInventoryCsv(selectedSource, selectedResult, source, profiles);
+      downloadTextFile(inventoryFileName(selectedSource), csv, 'text/csv;charset=utf-8');
+      const errorCount = [...profiles.values()].filter(profile => profile.profilingStatus.startsWith('profile_error')).length;
+      setCsvExportMessage(errorCount ? `Downloaded with ${errorCount} profile error${errorCount === 1 ? '' : 's'}.` : 'Downloaded profiled inventory CSV.');
+    } catch (error) {
+      setCsvExportMessage(error instanceof Error ? error.message : 'Unable to export profiled CSV');
+    } finally {
+      setCsvExporting(false);
+    }
   }
 
   return (
@@ -661,9 +695,10 @@ function FilesPage({
           <div><span className="eyebrow">File Visibility</span><h2>Source file inventory</h2></div>
           <div className="inventory-heading-actions">
             <span className="source-location">{selectedResult.source || sourceLocation(selectedSource)}</span>
-            <button className="secondary-action" disabled={!canDownloadCsv} onClick={downloadInventoryCsv}>
-              <Download size={15} />Download CSV
+            <button className="secondary-action" disabled={!canDownloadCsv || csvExporting} onClick={() => void downloadInventoryCsv()}>
+              <Download size={15} />{csvExporting ? 'Profiling...' : 'Download CSV'}
             </button>
+            {csvExportMessage && <span className="export-status">{csvExportMessage}</span>}
           </div>
         </div>
 
@@ -1322,7 +1357,99 @@ function sourceLocation(connection: FileConnection) {
   }
 }
 
-function buildInventoryCsv(connection: FileConnection, result: FileResult, source: string) {
+async function profileFilesForCsv(
+  token: string,
+  connection: FileConnection,
+  files: FileMetadata[],
+  onUnauthorized: () => void
+) {
+  const profiles = await mapWithConcurrency(files, 4, async file => {
+    try {
+      const response = await fetch('/api/files/profile', {
+        method: 'POST',
+        headers: appAuthHeaders(token, { 'content-type': 'application/json' }),
+        body: JSON.stringify({
+          type: connection.type,
+          config: connection.config,
+          file: {
+            name: file.name,
+            path: file.path,
+            kind: file.kind,
+            sizeBytes: file.sizeBytes
+          }
+        })
+      });
+      const body = await response.json();
+      if (response.status === 401) {
+        onUnauthorized();
+        throw new UnauthorizedError('Your session expired. Sign in again before exporting profiles.');
+      }
+      if (!response.ok || body.error) throw new Error(body.error || `Request failed with ${response.status}`);
+      return normalizeFileProfile(file, body);
+    } catch (error) {
+      if (error instanceof UnauthorizedError) throw error;
+      return fileProfileError(file, error instanceof Error ? error.message : 'Unable to profile file');
+    }
+  });
+
+  return new Map(profiles.map(profile => [profile.filePath, profile]));
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>
+) {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(limit, items.length);
+
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(items[index], index);
+    }
+  }));
+
+  return results;
+}
+
+function normalizeFileProfile(file: FileMetadata, value: Partial<FileProfile>): FileProfile {
+  return {
+    filePath: String(value.filePath || file.path),
+    rowCount: value.rowCount ?? 'not_profiled',
+    sourceSchemaJson: isRecord(value.sourceSchemaJson) ? stringifyRecordValues(value.sourceSchemaJson) : {},
+    primaryKeyCandidate: String(value.primaryKeyCandidate || 'none'),
+    identityCandidate: Boolean(value.identityCandidate),
+    nullableColumnCount: value.nullableColumnCount ?? 'not_profiled',
+    profilingStatus: String(value.profilingStatus || 'profiled')
+  };
+}
+
+function fileProfileError(file: FileMetadata, message: string): FileProfile {
+  return {
+    filePath: file.path,
+    rowCount: 'not_profiled',
+    sourceSchemaJson: {},
+    primaryKeyCandidate: 'none',
+    identityCandidate: false,
+    nullableColumnCount: 'not_profiled',
+    profilingStatus: `profile_error: ${message}`
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function stringifyRecordValues(value: Record<string, unknown>) {
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, String(entry)]));
+}
+
+class UnauthorizedError extends Error {}
+
+function buildInventoryCsv(connection: FileConnection, result: FileResult, source: string, profiles = new Map<string, FileProfile>()) {
   const headers = [
     'source_name',
     'source_type',
@@ -1343,25 +1470,28 @@ function buildInventoryCsv(connection: FileConnection, result: FileResult, sourc
     'profiling_status'
   ];
 
-  const rows = result.files.map(file => [
-    connection.name,
-    connection.type,
-    source,
-    file.name,
-    file.path,
-    file.kind,
-    file.sizeBytes,
-    file.modifiedAt,
-    file.owner,
-    file.storageClass,
-    file.encrypted,
-    file.rows ?? '',
-    '',
-    '',
-    '',
-    '',
-    'metadata_only'
-  ]);
+  const rows = result.files.map(file => {
+    const profile = profiles.get(file.path);
+    return [
+      connection.name,
+      connection.type,
+      source,
+      file.name,
+      file.path,
+      file.kind,
+      file.sizeBytes,
+      file.modifiedAt,
+      file.owner,
+      file.storageClass,
+      file.encrypted,
+      profile?.rowCount ?? file.rows ?? 'not_profiled',
+      profile ? JSON.stringify(profile.sourceSchemaJson) : '{}',
+      profile?.primaryKeyCandidate ?? 'not_profiled',
+      profile ? String(profile.identityCandidate) : 'false',
+      profile?.nullableColumnCount ?? 'not_profiled',
+      profile?.profilingStatus ?? 'metadata_only'
+    ];
+  });
 
   return [headers, ...rows].map(row => row.map(csvCell).join(',')).join('\r\n');
 }

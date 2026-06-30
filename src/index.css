@@ -324,6 +324,15 @@ button:disabled {
   min-width: 0;
 }
 
+.export-status {
+  max-width: 220px;
+  color: var(--gray-500);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .eyebrow {
   display: block;
   color: var(--blue);

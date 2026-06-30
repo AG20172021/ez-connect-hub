@@ -1,0 +1,494 @@
+import { createHmac, createHash, createSign } from 'node:crypto';
+import { createReadStream, promises as fs } from 'node:fs';
+import http from 'node:http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const staticRoot = path.resolve(__dirname, '../dist');
+const port = Number(process.env.PORT || 80);
+const maxBodyBytes = 1024 * 1024;
+const maxResponseBytes = 1024 * 1024;
+
+const mimeTypes = {
+  '.css': 'text/css; charset=utf-8',
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.txt': 'text/plain; charset=utf-8',
+  '.ico': 'image/x-icon'
+};
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+
+    if (req.method === 'GET' && url.pathname === '/api/health') {
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/files/list') {
+      const payload = await readJson(req);
+      const result = await listFiles(payload);
+      sendJson(res, 200, result);
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/http/request') {
+      const payload = await readJson(req);
+      const result = await proxyHttpRequest(payload);
+      sendJson(res, 200, result);
+      return;
+    }
+
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      sendJson(res, 405, { error: 'Method not allowed' });
+      return;
+    }
+
+    await serveStatic(url.pathname, res);
+  } catch (error) {
+    sendJson(res, 500, { error: error instanceof Error ? error.message : 'Unexpected server error' });
+  }
+});
+
+server.listen(port, () => {
+  console.log(`EZ Connect Hub listening on ${port}`);
+});
+
+async function readJson(req) {
+  const chunks = [];
+  let total = 0;
+
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > maxBodyBytes) {
+      throw new Error('Request body is too large');
+    }
+    chunks.push(chunk);
+  }
+
+  if (chunks.length === 0) return {};
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+function sendJson(res, statusCode, body) {
+  const json = JSON.stringify(body);
+  res.writeHead(statusCode, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store'
+  });
+  res.end(json);
+}
+
+async function serveStatic(pathname, res) {
+  const requestedPath = pathname === '/' ? '/index.html' : decodeURIComponent(pathname);
+  const safePath = path.normalize(requestedPath).replace(/^(\.\.[/\\])+/, '');
+  let filePath = path.join(staticRoot, safePath);
+
+  if (!filePath.startsWith(staticRoot)) {
+    sendJson(res, 403, { error: 'Forbidden' });
+    return;
+  }
+
+  try {
+    const stat = await fs.stat(filePath);
+    if (stat.isDirectory()) filePath = path.join(filePath, 'index.html');
+  } catch {
+    filePath = path.join(staticRoot, 'index.html');
+  }
+
+  const ext = path.extname(filePath);
+  res.writeHead(200, {
+    'content-type': mimeTypes[ext] || 'application/octet-stream',
+    'cache-control': ext === '.html' ? 'no-store' : 'public, max-age=31536000, immutable'
+  });
+  createReadStream(filePath).pipe(res);
+}
+
+async function listFiles(payload) {
+  const type = String(payload?.type || '');
+  const config = payload?.config || {};
+
+  switch (type) {
+    case 'azure':
+      return listAzure(config);
+    case 's3':
+      return listS3(config);
+    case 'gcs':
+      return listGcs(config);
+    case 'sftp':
+      throw new Error('SFTP listing needs an SSH client dependency and private network reachability. It is not enabled in this deployment yet.');
+    case 'local':
+      throw new Error('Local/NFS listing requires the path to be mounted inside the Fly machine. It is not enabled in this deployment yet.');
+    default:
+      throw new Error('Unsupported file source type');
+  }
+}
+
+async function listAzure(config) {
+  const details = parseAzureConfig(config);
+  const url = new URL(`${details.endpoint.replace(/\/$/, '')}/${encodeURIComponent(details.container)}`);
+  url.searchParams.set('restype', 'container');
+  url.searchParams.set('comp', 'list');
+  url.searchParams.set('maxresults', '200');
+  if (details.prefix) url.searchParams.set('prefix', details.prefix);
+  if (details.sas) appendSas(url, details.sas);
+
+  const headers = {};
+  if (details.accountKey && !details.sas) {
+    headers['x-ms-date'] = new Date().toUTCString();
+    headers['x-ms-version'] = '2020-10-02';
+    headers.Authorization = azureSharedKey('GET', url, details.accountName, details.accountKey, headers);
+  }
+
+  const response = await fetch(url, { headers });
+  const body = await response.text();
+  if (!response.ok) throw new Error(`Azure Blob returned ${response.status}: ${stripXml(body)}`);
+
+  return {
+    provider: 'azure',
+    source: `azure://${details.accountName}/${details.container}/${details.prefix || ''}`,
+    files: parseAzureBlobs(body, details)
+  };
+}
+
+function parseAzureConfig(config) {
+  const rawConnection = String(config.connectionString || '').trim();
+  const container = String(config.container || '').trim();
+  const prefix = String(config.pathPrefix || '').replace(/^\/+/, '');
+
+  if (!rawConnection) throw new Error('Azure connection string or SAS URL is required');
+
+  if (/^https?:\/\//i.test(rawConnection)) {
+    const parsed = new URL(rawConnection);
+    const pathParts = parsed.pathname.split('/').filter(Boolean);
+    const inferredContainer = container || pathParts[0];
+    if (!inferredContainer) throw new Error('Azure container is required');
+    return {
+      accountName: parsed.hostname.split('.')[0],
+      endpoint: `${parsed.protocol}//${parsed.hostname}`,
+      container: inferredContainer,
+      prefix: prefix || pathParts.slice(1).join('/'),
+      sas: parsed.search.replace(/^\?/, '')
+    };
+  }
+
+  const parts = parseConnectionString(rawConnection);
+  const accountName = parts.AccountName || String(config.account || '').trim();
+  const accountKey = parts.AccountKey;
+  const sas = parts.SharedAccessSignature;
+  const suffix = parts.EndpointSuffix || 'core.windows.net';
+  const protocol = parts.DefaultEndpointsProtocol || 'https';
+  const endpoint = parts.BlobEndpoint || `${protocol}://${accountName}.blob.${suffix}`;
+
+  if (!accountName) throw new Error('Azure storage account name is required');
+  if (!container) throw new Error('Azure container is required');
+  if (!accountKey && !sas) throw new Error('Azure connection string must include AccountKey or SharedAccessSignature');
+
+  return { accountName, accountKey, sas, endpoint, container, prefix };
+}
+
+function azureSharedKey(method, url, accountName, accountKey, headers) {
+  const canonicalHeaders = Object.entries(headers)
+    .filter(([key]) => key.toLowerCase().startsWith('x-ms-'))
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${key.toLowerCase()}:${String(value).trim()}\n`)
+    .join('');
+
+  const params = [...url.searchParams.entries()]
+    .map(([key, value]) => [key.toLowerCase(), value])
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${key}:${decodeURIComponent(value)}`)
+    .join('\n');
+
+  const canonicalResource = `/${accountName}${url.pathname}${params ? `\n${params}` : ''}`;
+  const stringToSign = [
+    method, '', '', '', '', '', '', '', '', '', '', '',
+    canonicalHeaders + canonicalResource
+  ].join('\n');
+
+  const signature = createHmac('sha256', Buffer.from(accountKey, 'base64')).update(stringToSign, 'utf8').digest('base64');
+  return `SharedKey ${accountName}:${signature}`;
+}
+
+function parseAzureBlobs(xml, details) {
+  return matchAll(xml, /<Blob>([\s\S]*?)<\/Blob>/g).map((blob, index) => {
+    const name = xmlValue(blob, 'Name');
+    const size = Number(xmlValue(blob, 'Content-Length') || 0);
+    return {
+      id: `${details.container}-${index}-${name}`,
+      name: path.posix.basename(name),
+      path: `azure://${details.accountName}/${details.container}/${name}`,
+      kind: fileKind(name, xmlValue(blob, 'Content-Type')),
+      sizeBytes: size,
+      modifiedAt: new Date(xmlValue(blob, 'Last-Modified') || Date.now()).toISOString(),
+      owner: details.accountName,
+      storageClass: xmlValue(blob, 'AccessTier') || xmlValue(blob, 'BlobType') || 'Blob',
+      encrypted: xmlValue(blob, 'ServerEncrypted') !== 'false'
+    };
+  });
+}
+
+async function listS3(config) {
+  const accessKey = String(config.accessKey || '').trim();
+  const secretKey = String(config.secretKey || '').trim();
+  const region = String(config.region || 'us-east-1').trim();
+  const bucket = String(config.bucket || '').trim();
+  const prefix = String(config.pathPrefix || '').replace(/^\/+/, '');
+  const endpoint = String(config.endpoint || '').replace(/\/$/, '');
+
+  if (!accessKey || !secretKey || !region || !bucket) throw new Error('S3 region, bucket, access key, and secret key are required');
+
+  const url = endpoint
+    ? new URL(`${endpoint}/${encodeURIComponent(bucket)}`)
+    : new URL(`https://${bucket}.s3.${region}.amazonaws.com/`);
+  url.searchParams.set('list-type', '2');
+  url.searchParams.set('max-keys', '200');
+  if (prefix) url.searchParams.set('prefix', prefix);
+
+  const headers = signS3Request(url, region, accessKey, secretKey);
+  const response = await fetch(url, { headers });
+  const body = await response.text();
+  if (!response.ok) throw new Error(`S3 returned ${response.status}: ${stripXml(body)}`);
+
+  return {
+    provider: 's3',
+    source: `s3://${bucket}/${prefix}`,
+    files: parseS3Objects(body, bucket)
+  };
+}
+
+function signS3Request(url, region, accessKey, secretKey) {
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = amzDate.slice(0, 8);
+  const payloadHash = sha256Hex('');
+  const query = [...url.searchParams.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${encodeRFC3986(key)}=${encodeRFC3986(value)}`)
+    .join('&');
+  const canonicalHeaders = `host:${url.host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`;
+  const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
+  const canonicalRequest = ['GET', url.pathname || '/', query, canonicalHeaders, signedHeaders, payloadHash].join('\n');
+  const credentialScope = `${dateStamp}/${region}/s3/aws4_request`;
+  const stringToSign = ['AWS4-HMAC-SHA256', amzDate, credentialScope, sha256Hex(canonicalRequest)].join('\n');
+  const signingKey = getAwsSigningKey(secretKey, dateStamp, region, 's3');
+  const signature = createHmac('sha256', signingKey).update(stringToSign).digest('hex');
+
+  return {
+    Authorization: `AWS4-HMAC-SHA256 Credential=${accessKey}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+    'x-amz-content-sha256': payloadHash,
+    'x-amz-date': amzDate
+  };
+}
+
+function parseS3Objects(xml, bucket) {
+  return matchAll(xml, /<Contents>([\s\S]*?)<\/Contents>/g).map((item, index) => {
+    const key = xmlValue(item, 'Key');
+    return {
+      id: `${bucket}-${index}-${key}`,
+      name: path.posix.basename(key),
+      path: `s3://${bucket}/${key}`,
+      kind: fileKind(key),
+      sizeBytes: Number(xmlValue(item, 'Size') || 0),
+      modifiedAt: new Date(xmlValue(item, 'LastModified') || Date.now()).toISOString(),
+      owner: bucket,
+      storageClass: xmlValue(item, 'StorageClass') || 'Standard',
+      encrypted: false
+    };
+  });
+}
+
+async function listGcs(config) {
+  const bucket = String(config.bucket || '').trim();
+  const projectId = String(config.projectId || '').trim();
+  const prefix = String(config.pathPrefix || '').replace(/^\/+/, '');
+  const serviceAccountText = String(config.serviceAccount || '').trim();
+
+  if (!bucket || !projectId || !serviceAccountText) throw new Error('GCS project, bucket, and service account JSON are required');
+  const serviceAccount = JSON.parse(serviceAccountText);
+  const token = await getGcsToken(serviceAccount);
+  const url = new URL(`https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o`);
+  url.searchParams.set('maxResults', '200');
+  if (prefix) url.searchParams.set('prefix', prefix);
+
+  const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  const body = await response.text();
+  if (!response.ok) throw new Error(`GCS returned ${response.status}: ${body.slice(0, 300)}`);
+  const data = JSON.parse(body);
+
+  return {
+    provider: 'gcs',
+    source: `gs://${bucket}/${prefix}`,
+    files: (data.items || []).map((item, index) => ({
+      id: `${bucket}-${index}-${item.name}`,
+      name: path.posix.basename(item.name),
+      path: `gs://${bucket}/${item.name}`,
+      kind: fileKind(item.name, item.contentType),
+      sizeBytes: Number(item.size || 0),
+      modifiedAt: new Date(item.updated || Date.now()).toISOString(),
+      owner: projectId,
+      storageClass: item.storageClass || 'Standard',
+      encrypted: true
+    }))
+  };
+}
+
+async function getGcsToken(serviceAccount) {
+  const iat = Math.floor(Date.now() / 1000);
+  const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const claim = base64url(JSON.stringify({
+    iss: serviceAccount.client_email,
+    scope: 'https://www.googleapis.com/auth/devstorage.read_only',
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: iat + 3600,
+    iat
+  }));
+  const unsigned = `${header}.${claim}`;
+  const signature = createSign('RSA-SHA256').update(unsigned).sign(serviceAccount.private_key);
+  const assertion = `${unsigned}.${base64url(signature)}`;
+  const response = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion
+    })
+  });
+  const body = await response.json();
+  if (!response.ok) throw new Error(`GCS auth failed: ${body.error_description || body.error || response.status}`);
+  return body.access_token;
+}
+
+async function proxyHttpRequest(payload) {
+  if (process.env.EZ_CONNECT_ENABLE_API_PROXY !== 'true') {
+    throw new Error('Server-side API proxy is disabled. Browser mode is available; enable EZ_CONNECT_ENABLE_API_PROXY=true behind auth before exposing a Postman-style proxy publicly.');
+  }
+
+  const target = new URL(String(payload.url || ''));
+  if (!['http:', 'https:'].includes(target.protocol)) throw new Error('Only HTTP and HTTPS URLs are allowed');
+  if (isPrivateHost(target.hostname)) throw new Error('Private and localhost targets are blocked');
+
+  const method = String(payload.method || 'GET').toUpperCase();
+  const headers = sanitizeHeaders(payload.headers || {});
+  const started = Date.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const response = await fetch(target, {
+      method,
+      headers,
+      body: ['GET', 'HEAD'].includes(method) ? undefined : String(payload.body || ''),
+      signal: controller.signal,
+      redirect: 'follow'
+    });
+    const text = await limitedText(response);
+    return {
+      status: response.status,
+      statusText: response.statusText,
+      timeMs: Date.now() - started,
+      headers: Object.fromEntries(response.headers.entries()),
+      body: text,
+      truncated: text.length >= maxResponseBytes
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function limitedText(response) {
+  const reader = response.body?.getReader();
+  if (!reader) return '';
+  const chunks = [];
+  let total = 0;
+
+  while (total < maxResponseBytes) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = Buffer.from(value);
+    total += chunk.length;
+    chunks.push(chunk.slice(0, Math.max(0, maxResponseBytes - (total - chunk.length))));
+  }
+
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function sanitizeHeaders(input) {
+  const output = {};
+  for (const [key, value] of Object.entries(input)) {
+    const normalized = key.toLowerCase();
+    if (['host', 'connection', 'content-length'].includes(normalized)) continue;
+    if (value != null && String(value).trim()) output[key] = String(value);
+  }
+  return output;
+}
+
+function isPrivateHost(hostname) {
+  const lower = hostname.toLowerCase();
+  return lower === 'localhost' || lower.endsWith('.localhost') || /^127\./.test(lower) || /^10\./.test(lower) || /^192\.168\./.test(lower) || /^172\.(1[6-9]|2\d|3[01])\./.test(lower);
+}
+
+function parseConnectionString(value) {
+  return Object.fromEntries(value.split(';').filter(Boolean).map(part => {
+    const index = part.indexOf('=');
+    return index === -1 ? [part, ''] : [part.slice(0, index), part.slice(index + 1)];
+  }));
+}
+
+function appendSas(url, sas) {
+  for (const [key, value] of new URLSearchParams(sas)) {
+    if (!url.searchParams.has(key)) url.searchParams.append(key, value);
+  }
+}
+
+function stripXml(xml) {
+  return xml.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 400);
+}
+
+function matchAll(text, regex) {
+  return [...text.matchAll(regex)].map(match => match[1]);
+}
+
+function xmlValue(text, tag) {
+  const match = text.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`));
+  return match ? decodeXml(match[1]) : '';
+}
+
+function decodeXml(text) {
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+function fileKind(name, contentType = '') {
+  const ext = path.posix.extname(name).replace('.', '').toUpperCase();
+  if (ext) return ext;
+  if (contentType) return contentType;
+  return 'File';
+}
+
+function sha256Hex(value) {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function getAwsSigningKey(secretKey, dateStamp, region, service) {
+  const dateKey = createHmac('sha256', `AWS4${secretKey}`).update(dateStamp).digest();
+  const regionKey = createHmac('sha256', dateKey).update(region).digest();
+  const serviceKey = createHmac('sha256', regionKey).update(service).digest();
+  return createHmac('sha256', serviceKey).update('aws4_request').digest();
+}
+
+function encodeRFC3986(value) {
+  return encodeURIComponent(value).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function base64url(value) {
+  return Buffer.from(value).toString('base64url');
+}

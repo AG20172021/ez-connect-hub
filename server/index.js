@@ -20,6 +20,13 @@ const mimeTypes = {
   '.ico': 'image/x-icon'
 };
 
+class AppError extends Error {
+  constructor(statusCode, message) {
+    super(message);
+    this.statusCode = statusCode;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -32,6 +39,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/files/list') {
       const payload = await readJson(req);
       const result = await listFiles(payload);
+      sendJson(res, 200, result);
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/database/test') {
+      const payload = await readJson(req);
+      const result = await testDatabase(payload);
       sendJson(res, 200, result);
       return;
     }
@@ -50,7 +64,8 @@ const server = http.createServer(async (req, res) => {
 
     await serveStatic(url.pathname, res);
   } catch (error) {
-    sendJson(res, 500, { error: error instanceof Error ? error.message : 'Unexpected server error' });
+    const statusCode = error instanceof AppError ? error.statusCode : 500;
+    sendJson(res, statusCode, { error: error instanceof Error ? error.message : 'Unexpected server error' });
   }
 });
 
@@ -81,6 +96,164 @@ function sendJson(res, statusCode, body) {
     'cache-control': 'no-store'
   });
   res.end(json);
+}
+
+async function testDatabase(payload) {
+  const type = String(payload?.type || '');
+  const config = payload?.config || {};
+
+  switch (type) {
+    case 'postgres':
+      return testPostgres(config);
+    case 'mysql':
+      return testMysql(config);
+    case 'mssql':
+      return testMssql(config);
+    case 'snowflake':
+      throw new AppError(501, 'Snowflake live connection testing is not enabled yet. Save the configuration locally, or add the Snowflake driver/test flow next.');
+    case 'bigquery':
+      throw new AppError(501, 'BigQuery live connection testing needs a service-account based configuration flow. Save the configuration locally, or add the BigQuery test flow next.');
+    default:
+      throw new AppError(400, 'Unsupported database source type');
+  }
+}
+
+async function testPostgres(config) {
+  const details = parseDbConfig(config, 5432);
+  return withDatabaseError('PostgreSQL', details, async () => {
+    const pg = await import('pg');
+    const Client = pg.Client || pg.default?.Client;
+    const client = new Client({
+      host: details.host,
+      port: details.port,
+      database: details.database,
+      user: details.username,
+      password: details.password,
+      ssl: dbSslOptions(details.sslMode),
+      connectionTimeoutMillis: 10000,
+      query_timeout: 10000,
+      application_name: 'ez-connect-hub'
+    });
+
+    try {
+      await client.connect();
+      const result = await client.query('select current_database() as database, current_user as "user", version() as version');
+      const row = result.rows?.[0] || {};
+      return dbSuccess('postgres', 'Connected to PostgreSQL.', row);
+    } finally {
+      await client.end().catch(() => {});
+    }
+  });
+}
+
+async function testMysql(config) {
+  const details = parseDbConfig(config, 3306);
+  return withDatabaseError('MySQL', details, async () => {
+    const mysql = await import('mysql2/promise');
+    const connection = await mysql.createConnection({
+      host: details.host,
+      port: details.port,
+      database: details.database,
+      user: details.username,
+      password: details.password,
+      connectTimeout: 10000,
+      ssl: dbSslOptions(details.sslMode) || undefined
+    });
+
+    try {
+      const [rows] = await connection.query('select database() as database, user() as user, version() as version');
+      return dbSuccess('mysql', 'Connected to MySQL.', rows?.[0] || {});
+    } finally {
+      await connection.end().catch(() => {});
+    }
+  });
+}
+
+async function testMssql(config) {
+  const details = parseDbConfig(config, 1433);
+  return withDatabaseError('SQL Server', details, async () => {
+    const mssqlModule = await import('mssql');
+    const sql = mssqlModule.default || mssqlModule;
+    const pool = new sql.ConnectionPool({
+      server: details.host,
+      port: details.port,
+      database: details.database,
+      user: details.username,
+      password: details.password,
+      connectionTimeout: 10000,
+      requestTimeout: 10000,
+      pool: { min: 0, max: 1, idleTimeoutMillis: 1000 },
+      options: {
+        encrypt: details.sslMode !== 'disable',
+        trustServerCertificate: !['verify-ca', 'verify-full'].includes(details.sslMode)
+      }
+    });
+
+    try {
+      await pool.connect();
+      const result = await pool.request().query('select DB_NAME() as [database], SUSER_SNAME() as [user], @@VERSION as [version]');
+      return dbSuccess('mssql', 'Connected to SQL Server.', result.recordset?.[0] || {});
+    } finally {
+      await pool.close().catch(() => {});
+    }
+  });
+}
+
+function parseDbConfig(config, defaultPort) {
+  const details = {
+    host: String(config.host || '').trim(),
+    port: Number(config.port || defaultPort),
+    database: String(config.database || '').trim(),
+    username: String(config.username || '').trim(),
+    password: String(config.password || ''),
+    sslMode: String(config.sslMode || 'disable').trim().toLowerCase()
+  };
+  const missing = [];
+  if (!details.host) missing.push('Host');
+  if (!Number.isFinite(details.port) || details.port <= 0) missing.push('Port');
+  if (!details.database) missing.push('Database');
+  if (!details.username) missing.push('Username');
+  if (!details.password) missing.push('Password');
+  if (missing.length) throw new AppError(400, `Missing: ${missing.join(', ')}`);
+  if (!['disable', 'require', 'verify-ca', 'verify-full'].includes(details.sslMode)) {
+    throw new AppError(400, 'SSL Mode must be disable, require, verify-ca, or verify-full');
+  }
+  return details;
+}
+
+function dbSslOptions(sslMode) {
+  if (!sslMode || sslMode === 'disable') return false;
+  return { rejectUnauthorized: ['verify-ca', 'verify-full'].includes(sslMode) };
+}
+
+async function withDatabaseError(provider, details, fn) {
+  try {
+    return await fn();
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(502, `${provider} connection failed: ${redactDbError(error, details)}`);
+  }
+}
+
+function dbSuccess(provider, message, row) {
+  const version = String(row.version || '').split('\n')[0].trim();
+  return {
+    provider,
+    message,
+    metadata: {
+      database: String(row.database || ''),
+      user: String(row.user || ''),
+      version
+    }
+  };
+}
+
+function redactDbError(error, details) {
+  let message = error instanceof Error ? error.message : String(error);
+  for (const value of [details.password, details.username]) {
+    if (value) message = message.split(value).join('[redacted]');
+  }
+  return message.replace(/\s+/g, ' ').trim().slice(0, 500);
 }
 
 async function serveStatic(pathname, res) {

@@ -5,6 +5,7 @@ import { Check, ChevronDown, Database, FileText, FolderOpen, Globe, HardDrive, P
 type Section = 'files' | 'database' | 'api';
 type ConnectorType = 's3' | 'gcs' | 'azure' | 'sftp' | 'local';
 type ConnectionStatus = 'connected' | 'disconnected';
+type DbConnectionStatus = 'connected' | 'saved' | 'error' | 'disconnected';
 type RequestMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD';
 type ApiTab = 'params' | 'authorization' | 'headers' | 'body' | 'settings';
 type AuthType = 'No Auth' | 'Basic Auth' | 'Bearer Token' | 'JWT Bearer' | 'Digest Auth' | 'OAuth 1.0' | 'OAuth 2.0' | 'Hawk Authentication' | 'AWS Signature' | 'NTLM Authentication' | 'API Key' | 'Akamai EdgeGrid' | 'ASAP (Atlassian)';
@@ -32,10 +33,14 @@ type FileConnection = {
 
 type DbConnection = {
   id: string;
+  type: 'postgres' | 'mysql' | 'mssql' | 'snowflake' | 'bigquery';
   name: string;
   color: string;
   icon: string;
+  status: DbConnectionStatus;
   config: Record<string, string>;
+  message?: string;
+  metadata?: Record<string, string>;
 };
 
 type FileMetadata = {
@@ -97,11 +102,11 @@ const fileConnectors: FileConnection[] = [
 ];
 
 const dbConnectors: DbConnection[] = [
-  { id: 'postgres', name: 'PostgreSQL', color: '#336791', icon: 'PG', config: {} },
-  { id: 'mysql', name: 'MySQL', color: '#00618A', icon: 'SQL', config: {} },
-  { id: 'mssql', name: 'SQL Server', color: '#CC2927', icon: 'MS', config: {} },
-  { id: 'snowflake', name: 'Snowflake', color: '#29B5E8', icon: 'SF', config: {} },
-  { id: 'bigquery', name: 'BigQuery', color: '#4285F4', icon: 'BQ', config: {} }
+  { id: 'postgres', type: 'postgres', name: 'PostgreSQL', color: '#336791', icon: 'PG', status: 'disconnected', config: {} },
+  { id: 'mysql', type: 'mysql', name: 'MySQL', color: '#00618A', icon: 'SQL', status: 'disconnected', config: {} },
+  { id: 'mssql', type: 'mssql', name: 'SQL Server', color: '#CC2927', icon: 'MS', status: 'disconnected', config: {} },
+  { id: 'snowflake', type: 'snowflake', name: 'Snowflake', color: '#29B5E8', icon: 'SF', status: 'disconnected', config: {} },
+  { id: 'bigquery', type: 'bigquery', name: 'BigQuery', color: '#4285F4', icon: 'BQ', status: 'disconnected', config: {} }
 ];
 
 const fieldsByType: Record<ConnectorType, Field[]> = {
@@ -138,7 +143,7 @@ const fieldsByType: Record<ConnectorType, Field[]> = {
   ]
 };
 
-const dbFields: Field[] = [
+const sqlDbFields: Field[] = [
   { key: 'host', label: 'Host' },
   { key: 'port', label: 'Port', type: 'number' },
   { key: 'database', label: 'Database' },
@@ -146,6 +151,27 @@ const dbFields: Field[] = [
   { key: 'password', label: 'Password', type: 'password' },
   { key: 'sslMode', label: 'SSL Mode', placeholder: 'require', optional: true }
 ];
+
+const dbFieldsByType: Record<DbConnection['type'], Field[]> = {
+  postgres: sqlDbFields,
+  mysql: sqlDbFields,
+  mssql: sqlDbFields,
+  snowflake: [
+    { key: 'account', label: 'Account Identifier', placeholder: 'xy12345.us-east-1' },
+    { key: 'username', label: 'Username' },
+    { key: 'password', label: 'Password', type: 'password' },
+    { key: 'warehouse', label: 'Warehouse' },
+    { key: 'database', label: 'Database' },
+    { key: 'schema', label: 'Schema', optional: true },
+    { key: 'role', label: 'Role', optional: true }
+  ],
+  bigquery: [
+    { key: 'projectId', label: 'Project ID' },
+    { key: 'dataset', label: 'Dataset' },
+    { key: 'serviceAccount', label: 'Service Account JSON', control: 'textarea' },
+    { key: 'location', label: 'Location', optional: true }
+  ]
+};
 
 const methods: RequestMethod[] = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'];
 const authTypes: AuthType[] = ['No Auth', 'Basic Auth', 'Bearer Token', 'JWT Bearer', 'Digest Auth', 'OAuth 1.0', 'OAuth 2.0', 'Hawk Authentication', 'AWS Signature', 'NTLM Authentication', 'API Key', 'Akamai EdgeGrid', 'ASAP (Atlassian)'];
@@ -262,16 +288,60 @@ function App() {
     }
   }
 
+  function missingDbFields() {
+    if (!editingDb) return [];
+    return dbFieldsByType[editingDb.type].filter(field => !field.optional && !draftConfig[field.key]?.trim()).map(field => field.label);
+  }
+
   function saveDbConnection() {
     if (!editingDb) return;
-    const missing = dbFields.filter(field => !field.optional && !draftConfig[field.key]?.trim()).map(field => field.label);
+    const missing = missingDbFields();
     if (missing.length) {
       setModalMessage(`Missing: ${missing.join(', ')}`);
       return;
     }
 
-    setDbConnections(current => current.map(connection => connection.id === editingDb.id ? { ...connection, config: draftConfig } : connection));
-    setModalMessage('Database configuration saved. Driver-backed testing is not enabled yet.');
+    setDbConnections(current => current.map(connection => connection.id === editingDb.id
+      ? { ...connection, config: draftConfig, status: 'saved', message: 'Saved locally. Connection has not been tested.' }
+      : connection));
+    closeModal();
+  }
+
+  async function testDbConnection() {
+    if (!editingDb) return;
+    const missing = missingDbFields();
+    if (missing.length) {
+      setModalMessage(`Missing: ${missing.join(', ')}`);
+      return;
+    }
+
+    setModalMessage('Testing database connection...');
+    try {
+      const response = await fetch('/api/database/test', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: editingDb.type, config: draftConfig })
+      });
+      const body = await response.json();
+      if (!response.ok || body.error) throw new Error(body.error || `Request failed with ${response.status}`);
+
+      setDbConnections(current => current.map(connection => connection.id === editingDb.id
+        ? {
+          ...connection,
+          config: draftConfig,
+          status: 'connected',
+          message: body.message || 'Database connection tested successfully.',
+          metadata: body.metadata || {}
+        }
+        : connection));
+      closeModal();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to test database connection';
+      setModalMessage(message);
+      setDbConnections(current => current.map(connection => connection.id === editingDb.id
+        ? { ...connection, config: draftConfig, status: 'error', message }
+        : connection));
+    }
   }
 
   return (
@@ -323,15 +393,15 @@ function App() {
       {editingDb && (
         <ConfigModal
           title={`Configure ${editingDb.name}`}
-          fields={dbFields}
+          fields={dbFieldsByType[editingDb.type]}
           config={draftConfig}
-          message={modalMessage || 'Configuration is saved locally in this browser session. Live DB testing needs backend drivers and network access.'}
-          primaryLabel="Save Config"
-          secondaryLabel="Close"
+          message={modalMessage || 'Save & Test validates the database from the server. Save Only keeps the fields in this browser without marking it connected.'}
+          primaryLabel="Save & Test"
+          secondaryLabel="Save Only"
           onChange={setDraftConfig}
           onClose={closeModal}
-          onPrimary={saveDbConnection}
-          onSecondary={closeModal}
+          onPrimary={() => void testDbConnection()}
+          onSecondary={saveDbConnection}
         />
       )}
     </div>
@@ -451,7 +521,7 @@ function DatabasePage({ connections, onConfigure }: { connections: DbConnection[
       <header className="section-header">
         <div>
           <h1>Database Connections</h1>
-          <p>Save database connection details for the next backend driver pass.</p>
+          <p>Test database reachability from the server before marking a source connected.</p>
         </div>
       </header>
       <div className="connector-grid">
@@ -459,10 +529,10 @@ function DatabasePage({ connections, onConfigure }: { connections: DbConnection[
           <article className="connector-card" key={connection.id}>
             <div className="connector-topline">
               <span className="connector-icon" style={{ backgroundColor: `${connection.color}20`, color: connection.color }}>{connection.icon}</span>
-              <span className="status-pill">{Object.keys(connection.config).length ? 'Configured' : 'Not Connected'}</span>
+              <span className={`status-pill ${dbStatusClass(connection.status)}`}>{connection.status === 'connected' && <Check size={12} />}{dbStatusLabel(connection.status)}</span>
             </div>
             <h2>{connection.name}</h2>
-            <p className="card-muted">Driver-backed testing is not enabled yet.</p>
+            <p className={connection.status === 'error' ? 'card-error' : 'card-muted'}>{databaseCardMessage(connection)}</p>
             <button className="configure-button" onClick={() => onConfigure(connection)}><Settings size={14} />Configure</button>
           </article>
         ))}
@@ -946,6 +1016,32 @@ function sourceLocation(connection: FileConnection) {
     case 'sftp': return `${config.host || 'host'}:${config.baseDir || '/'}`;
     case 'local': return config.mountPath || '/mnt/source';
   }
+}
+
+function dbStatusLabel(status: DbConnectionStatus) {
+  switch (status) {
+    case 'connected': return 'Connected';
+    case 'saved': return 'Saved';
+    case 'error': return 'Needs Attention';
+    case 'disconnected': return 'Not Connected';
+  }
+}
+
+function dbStatusClass(status: DbConnectionStatus) {
+  switch (status) {
+    case 'connected': return 'connected';
+    case 'saved': return 'saved';
+    case 'error': return 'error';
+    case 'disconnected': return '';
+  }
+}
+
+function databaseCardMessage(connection: DbConnection) {
+  if (connection.message) return connection.message;
+  if (['postgres', 'mysql', 'mssql'].includes(connection.type)) {
+    return 'Use Save & Test to validate credentials and reachability.';
+  }
+  return 'Live testing is not enabled for this provider yet. Save Only keeps local fields without marking it connected.';
 }
 
 function formatBytes(bytes: number) {

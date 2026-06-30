@@ -739,7 +739,13 @@ async function profileFile(payload) {
     return profilePlaceholder(filePath, `unsupported_format_${String(file.kind || fileKind(fileName || filePath)).toLowerCase()}`);
   }
 
-  const sample = await readProfileSample(type, config, filePath);
+  let sample;
+  try {
+    sample = await readProfileSample(type, config, filePath);
+  } catch (error) {
+    return profilePlaceholder(filePath, profileErrorStatus(error));
+  }
+
   if (looksBinary(sample)) return profilePlaceholder(filePath, 'unsupported_binary_sample');
 
   const parsed = parseProfileSample(sample, format);
@@ -748,8 +754,8 @@ async function profileFile(payload) {
       filePath,
       rowCount: 0,
       sourceSchemaJson: {},
-      primaryKeyCandidate: 'none',
-      identityCandidate: false,
+      primaryKeyCandidate: 'FALSE',
+      identityCandidate: 'FALSE',
       nullableColumnCount: 0,
       profilingStatus: 'profiled_no_rows'
     };
@@ -793,11 +799,31 @@ function profilePlaceholder(filePath, status) {
     filePath,
     rowCount: 'not_profiled',
     sourceSchemaJson: {},
-    primaryKeyCandidate: 'none',
-    identityCandidate: false,
+    primaryKeyCandidate: 'FALSE',
+    identityCandidate: 'FALSE',
     nullableColumnCount: 'not_profiled',
     profilingStatus: status
   };
+}
+
+function profileErrorStatus(error) {
+  const message = error instanceof Error ? error.message : 'profile_error';
+  if (/Azure Blob 403 AuthorizationResourceTypeMismatch/i.test(message)) {
+    return 'not_profiled_azure_sas_needs_blob_or_object_resource';
+  }
+  if (/Azure Blob 403 AuthorizationPermissionMismatch/i.test(message)) {
+    return 'not_profiled_azure_sas_needs_read_permission';
+  }
+  return `not_profiled_${statusToken(message)}`;
+}
+
+function statusToken(value) {
+  return String(value || 'profile_error')
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 96) || 'profile_error';
 }
 
 async function readProfileSample(type, config, filePath) {
@@ -897,8 +923,14 @@ async function readGcsSample(config, filePath) {
 async function fetchSampleText(url, headers, label) {
   const response = await fetch(url, { headers });
   const text = await limitedText(response);
-  if (!response.ok) throw new AppError(502, `${label} returned ${response.status}: ${text.slice(0, 300)}`);
+  if (!response.ok) throw new AppError(response.status, `${label} ${response.status} ${responseErrorCode(text, response.statusText)}`);
   return text.slice(0, profileSampleBytes);
+}
+
+function responseErrorCode(text, fallback) {
+  const xmlCode = xmlValue(text, 'Code');
+  if (xmlCode) return xmlCode;
+  return statusToken(stripXml(text) || fallback || 'request_failed');
 }
 
 function parseBucketPath(filePath, scheme) {
@@ -1065,13 +1097,14 @@ function inferProfile(columns, rows, formatLabel) {
   const stats = columns.map(column => columnStats(column, rows));
   const sourceSchemaJson = Object.fromEntries(stats.map(stat => [stat.name, inferDatabricksType(stat.nonNullValues)]));
   const nullableColumnCount = stats.filter(stat => stat.nullCount > 0).length;
-  const primaryKey = choosePrimaryKey(stats, rows.length);
+  const primaryKeyColumns = choosePrimaryKeyColumns(stats, rows);
+  const keyExpression = primaryKeyColumns.length ? primaryKeyColumns.join(',') : 'FALSE';
 
   return {
     rowCount: rows.length,
     sourceSchemaJson,
-    primaryKeyCandidate: primaryKey?.name || 'none',
-    identityCandidate: Boolean(primaryKey && isIdentityCandidate(primaryKey)),
+    primaryKeyCandidate: keyExpression,
+    identityCandidate: keyExpression,
     nullableColumnCount,
     profilingStatus: `profiled_${formatLabel}_sample_rows_${rows.length}`
   };
@@ -1089,9 +1122,50 @@ function columnStats(column, rows) {
   };
 }
 
-function choosePrimaryKey(stats, rowCount) {
+function choosePrimaryKeyColumns(stats, rows) {
+  const singleKey = chooseSingleKey(stats, rows.length);
+  if (singleKey) return [singleKey.name];
+  return chooseCompositeKey(stats, rows);
+}
+
+function chooseSingleKey(stats, rowCount) {
   const candidates = stats.filter(stat => rowCount > 0 && stat.nullCount === 0 && stat.distinctCount === rowCount);
   return candidates.sort((a, b) => keyScore(b) - keyScore(a))[0];
+}
+
+function chooseCompositeKey(stats, rows) {
+  if (!rows.length) return [];
+  const candidates = stats
+    .filter(stat => stat.nullCount === 0 && stat.distinctCount > 1)
+    .sort((a, b) => (keyScore(b) + b.distinctCount) - (keyScore(a) + a.distinctCount))
+    .slice(0, 8);
+
+  for (const size of [2, 3]) {
+    for (const combo of combinations(candidates, size)) {
+      if (isUniqueCombination(combo, rows)) return combo.map(stat => stat.name);
+    }
+  }
+
+  return [];
+}
+
+function combinations(items, size, start = 0, prefix = []) {
+  if (prefix.length === size) return [prefix];
+  const output = [];
+  for (let index = start; index <= items.length - (size - prefix.length); index += 1) {
+    output.push(...combinations(items, size, index + 1, [...prefix, items[index]]));
+  }
+  return output;
+}
+
+function isUniqueCombination(stats, rows) {
+  const seen = new Set();
+  for (const row of rows) {
+    const key = stats.map(stat => String(row[stat.name] ?? '')).join('\u001f');
+    if (seen.has(key)) return false;
+    seen.add(key);
+  }
+  return true;
 }
 
 function keyScore(stat) {
@@ -1103,11 +1177,6 @@ function keyScore(stat) {
   if (name.includes('identifier')) score += 4;
   if (stat.type === 'BIGINT') score += 2;
   return score;
-}
-
-function isIdentityCandidate(stat) {
-  const name = stat.name.toLowerCase();
-  return stat.type === 'BIGINT' && (name === 'id' || name.endsWith('_id') || name.includes('key'));
 }
 
 function inferDatabricksType(values) {

@@ -70,7 +70,7 @@ type FileProfile = {
   rowCount: number | string;
   sourceSchemaJson: Record<string, string>;
   primaryKeyCandidate: string;
-  identityCandidate: boolean;
+  identityCandidate: string;
   nullableColumnCount: number | string;
   profilingStatus: string;
 };
@@ -646,8 +646,8 @@ function FilesPage({
       const profiles = await profileFilesForCsv(appAuthToken, selectedSource, selectedResult.files, onUnauthorized);
       const csv = buildInventoryCsv(selectedSource, selectedResult, source, profiles);
       downloadTextFile(inventoryFileName(selectedSource), csv, 'text/csv;charset=utf-8');
-      const errorCount = [...profiles.values()].filter(profile => profile.profilingStatus.startsWith('profile_error')).length;
-      setCsvExportMessage(errorCount ? `Downloaded with ${errorCount} profile error${errorCount === 1 ? '' : 's'}.` : 'Downloaded profiled inventory CSV.');
+      const unprofiledCount = [...profiles.values()].filter(profile => !profile.profilingStatus.startsWith('profiled_')).length;
+      setCsvExportMessage(unprofiledCount ? `Downloaded with ${unprofiledCount} unprofiled file${unprofiledCount === 1 ? '' : 's'}.` : 'Downloaded profiled inventory CSV.');
     } catch (error) {
       setCsvExportMessage(error instanceof Error ? error.message : 'Unable to export profiled CSV');
     } finally {
@@ -1420,8 +1420,8 @@ function normalizeFileProfile(file: FileMetadata, value: Partial<FileProfile>): 
     filePath: String(value.filePath || file.path),
     rowCount: value.rowCount ?? 'not_profiled',
     sourceSchemaJson: isRecord(value.sourceSchemaJson) ? stringifyRecordValues(value.sourceSchemaJson) : {},
-    primaryKeyCandidate: String(value.primaryKeyCandidate || 'none'),
-    identityCandidate: Boolean(value.identityCandidate),
+    primaryKeyCandidate: String(value.primaryKeyCandidate || 'FALSE'),
+    identityCandidate: String(value.identityCandidate || 'FALSE'),
     nullableColumnCount: value.nullableColumnCount ?? 'not_profiled',
     profilingStatus: String(value.profilingStatus || 'profiled')
   };
@@ -1432,11 +1432,20 @@ function fileProfileError(file: FileMetadata, message: string): FileProfile {
     filePath: file.path,
     rowCount: 'not_profiled',
     sourceSchemaJson: {},
-    primaryKeyCandidate: 'none',
-    identityCandidate: false,
+    primaryKeyCandidate: 'FALSE',
+    identityCandidate: 'FALSE',
     nullableColumnCount: 'not_profiled',
-    profilingStatus: `profile_error: ${message}`
+    profilingStatus: `profile_error_${csvStatusToken(message)}`
   };
+}
+
+function csvStatusToken(value: string) {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 96) || 'profile_error';
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1486,8 +1495,8 @@ function buildInventoryCsv(connection: FileConnection, result: FileResult, sourc
       file.encrypted,
       profile?.rowCount ?? file.rows ?? 'not_profiled',
       profile ? JSON.stringify(profile.sourceSchemaJson) : '{}',
-      profile?.primaryKeyCandidate ?? 'not_profiled',
-      profile ? String(profile.identityCandidate) : 'false',
+      profile?.primaryKeyCandidate ?? 'FALSE',
+      profile?.identityCandidate ?? 'FALSE',
       profile?.nullableColumnCount ?? 'not_profiled',
       profile?.profilingStatus ?? 'metadata_only'
     ];

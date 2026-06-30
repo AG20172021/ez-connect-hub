@@ -36,6 +36,20 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/capabilities') {
+      sendJson(res, 200, {
+        apiProxyEnabled: process.env.EZ_CONNECT_ENABLE_API_PROXY === 'true',
+        fileConnectors: {
+          s3: true,
+          gcs: true,
+          azure: true,
+          sftp: false,
+          local: false
+        }
+      });
+      return;
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/files/list') {
       const payload = await readJson(req);
       const result = await listFiles(payload);
@@ -80,13 +94,17 @@ async function readJson(req) {
   for await (const chunk of req) {
     total += chunk.length;
     if (total > maxBodyBytes) {
-      throw new Error('Request body is too large');
+      throw new AppError(413, 'Request body is too large');
     }
     chunks.push(chunk);
   }
 
   if (chunks.length === 0) return {};
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    throw new AppError(400, 'Request body must be valid JSON');
+  }
 }
 
 function sendJson(res, statusCode, body) {
@@ -293,11 +311,11 @@ async function listFiles(payload) {
     case 'gcs':
       return listGcs(config);
     case 'sftp':
-      throw new Error('SFTP listing needs an SSH client dependency and private network reachability. It is not enabled in this deployment yet.');
+      throw new AppError(501, 'SFTP listing needs an SSH client dependency and private network reachability. It is not enabled in this deployment yet.');
     case 'local':
-      throw new Error('Local/NFS listing requires the path to be mounted inside the Fly machine. It is not enabled in this deployment yet.');
+      throw new AppError(501, 'Local/NFS listing requires the path to be mounted inside the Fly machine. It is not enabled in this deployment yet.');
     default:
-      throw new Error('Unsupported file source type');
+      throw new AppError(400, 'Unsupported file source type');
   }
 }
 
@@ -319,7 +337,7 @@ async function listAzure(config) {
 
   const response = await fetch(url, { headers });
   const body = await response.text();
-  if (!response.ok) throw new Error(`Azure Blob returned ${response.status}: ${stripXml(body)}`);
+  if (!response.ok) throw new AppError(502, `Azure Blob returned ${response.status}: ${stripXml(body)}`);
 
   return {
     provider: 'azure',
@@ -333,13 +351,13 @@ function parseAzureConfig(config) {
   const container = String(config.container || '').trim();
   const prefix = String(config.pathPrefix || '').replace(/^\/+/, '');
 
-  if (!rawConnection) throw new Error('Azure connection string or SAS URL is required');
+  if (!rawConnection) throw new AppError(400, 'Azure connection string or SAS URL is required');
 
   if (/^https?:\/\//i.test(rawConnection)) {
     const parsed = new URL(rawConnection);
     const pathParts = parsed.pathname.split('/').filter(Boolean);
     const inferredContainer = container || pathParts[0];
-    if (!inferredContainer) throw new Error('Azure container is required');
+    if (!inferredContainer) throw new AppError(400, 'Azure container is required');
     return {
       accountName: parsed.hostname.split('.')[0],
       endpoint: `${parsed.protocol}//${parsed.hostname}`,
@@ -357,9 +375,9 @@ function parseAzureConfig(config) {
   const protocol = parts.DefaultEndpointsProtocol || 'https';
   const endpoint = parts.BlobEndpoint || `${protocol}://${accountName}.blob.${suffix}`;
 
-  if (!accountName) throw new Error('Azure storage account name is required');
-  if (!container) throw new Error('Azure container is required');
-  if (!accountKey && !sas) throw new Error('Azure connection string must include AccountKey or SharedAccessSignature');
+  if (!accountName) throw new AppError(400, 'Azure storage account name is required');
+  if (!container) throw new AppError(400, 'Azure container is required');
+  if (!accountKey && !sas) throw new AppError(400, 'Azure connection string must include AccountKey or SharedAccessSignature');
 
   return { accountName, accountKey, sas, endpoint, container, prefix };
 }
@@ -413,7 +431,7 @@ async function listS3(config) {
   const prefix = String(config.pathPrefix || '').replace(/^\/+/, '');
   const endpoint = String(config.endpoint || '').replace(/\/$/, '');
 
-  if (!accessKey || !secretKey || !region || !bucket) throw new Error('S3 region, bucket, access key, and secret key are required');
+  if (!accessKey || !secretKey || !region || !bucket) throw new AppError(400, 'S3 region, bucket, access key, and secret key are required');
 
   const url = endpoint
     ? new URL(`${endpoint}/${encodeURIComponent(bucket)}`)
@@ -425,7 +443,7 @@ async function listS3(config) {
   const headers = signS3Request(url, region, accessKey, secretKey);
   const response = await fetch(url, { headers });
   const body = await response.text();
-  if (!response.ok) throw new Error(`S3 returned ${response.status}: ${stripXml(body)}`);
+  if (!response.ok) throw new AppError(502, `S3 returned ${response.status}: ${stripXml(body)}`);
 
   return {
     provider: 's3',
@@ -481,8 +499,13 @@ async function listGcs(config) {
   const prefix = String(config.pathPrefix || '').replace(/^\/+/, '');
   const serviceAccountText = String(config.serviceAccount || '').trim();
 
-  if (!bucket || !projectId || !serviceAccountText) throw new Error('GCS project, bucket, and service account JSON are required');
-  const serviceAccount = JSON.parse(serviceAccountText);
+  if (!bucket || !projectId || !serviceAccountText) throw new AppError(400, 'GCS project, bucket, and service account JSON are required');
+  let serviceAccount;
+  try {
+    serviceAccount = JSON.parse(serviceAccountText);
+  } catch {
+    throw new AppError(400, 'GCS service account JSON must be valid JSON');
+  }
   const token = await getGcsToken(serviceAccount);
   const url = new URL(`https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o`);
   url.searchParams.set('maxResults', '200');
@@ -490,7 +513,7 @@ async function listGcs(config) {
 
   const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   const body = await response.text();
-  if (!response.ok) throw new Error(`GCS returned ${response.status}: ${body.slice(0, 300)}`);
+  if (!response.ok) throw new AppError(502, `GCS returned ${response.status}: ${body.slice(0, 300)}`);
   const data = JSON.parse(body);
 
   return {
@@ -532,18 +555,23 @@ async function getGcsToken(serviceAccount) {
     })
   });
   const body = await response.json();
-  if (!response.ok) throw new Error(`GCS auth failed: ${body.error_description || body.error || response.status}`);
+  if (!response.ok) throw new AppError(502, `GCS auth failed: ${body.error_description || body.error || response.status}`);
   return body.access_token;
 }
 
 async function proxyHttpRequest(payload) {
   if (process.env.EZ_CONNECT_ENABLE_API_PROXY !== 'true') {
-    throw new Error('Server-side API proxy is disabled. Browser mode is available; enable EZ_CONNECT_ENABLE_API_PROXY=true behind auth before exposing a Postman-style proxy publicly.');
+    throw new AppError(403, 'Server-side API proxy is disabled. Browser mode is available; enable EZ_CONNECT_ENABLE_API_PROXY=true behind auth before exposing a Postman-style proxy publicly.');
   }
 
-  const target = new URL(String(payload.url || ''));
-  if (!['http:', 'https:'].includes(target.protocol)) throw new Error('Only HTTP and HTTPS URLs are allowed');
-  if (isPrivateHost(target.hostname)) throw new Error('Private and localhost targets are blocked');
+  let target;
+  try {
+    target = new URL(String(payload.url || ''));
+  } catch {
+    throw new AppError(400, 'A valid request URL is required');
+  }
+  if (!['http:', 'https:'].includes(target.protocol)) throw new AppError(400, 'Only HTTP and HTTPS URLs are allowed');
+  if (isPrivateHost(target.hostname)) throw new AppError(403, 'Private and localhost targets are blocked');
 
   const method = String(payload.method || 'GET').toUpperCase();
   const headers = sanitizeHeaders(payload.headers || {});

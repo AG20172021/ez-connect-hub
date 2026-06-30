@@ -140,6 +140,14 @@ button:disabled {
   padding: 18px;
 }
 
+.connector-card.disabled {
+  background: var(--gray-50);
+}
+
+.connector-card.disabled .connector-icon {
+  opacity: .72;
+}
+
 .connector-topline, .inventory-heading, .modal header, .modal footer {
   display: flex;
   align-items: center;
@@ -221,6 +229,11 @@ button:disabled {
 
 .configure-button {
   width: 100%;
+}
+
+.configure-button:disabled, .primary-action:disabled, .secondary-action:disabled {
+  cursor: not-allowed;
+  opacity: .58;
 }
 
 .primary-action {
@@ -435,6 +448,32 @@ td small {
 
 .form-field textarea {
   resize: vertical;
+}
+
+.secret-control {
+  display: grid;
+  gap: 8px;
+}
+
+.secret-textarea.masked {
+  color: transparent;
+  text-shadow: 0 0 8px rgba(17, 24, 39, .72);
+}
+
+.secret-textarea.masked::selection {
+  background: transparent;
+}
+
+.secret-toggle {
+  justify-self: start;
+  min-height: 30px;
+  padding: 6px 10px;
+  border: 1px solid var(--gray-300);
+  border-radius: 6px;
+  background: white;
+  color: var(--gray-700);
+  font-size: 12px;
+  font-weight: 800;
 }
 
 .form-field input:focus, .form-field textarea:focus, .form-field select:focus, .request-line input:focus, .request-line select:focus, .kv-row input:focus {
@@ -759,6 +798,10 @@ td small {
   background: white;
   color: var(--gray-700);
   font-size: 13px;
+}
+
+.compact-select option:disabled {
+  color: var(--gray-500);
 }
 
 .toggle-switch {

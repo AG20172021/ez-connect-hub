@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Check, ChevronDown, Database, FileText, FolderOpen, Globe, HardDrive, Plus, RefreshCw, Send, Settings, ShieldCheck, Trash2, X, Zap } from 'lucide-react';
 
@@ -29,6 +29,8 @@ type FileConnection = {
   color: string;
   icon: string;
   config: Record<string, string>;
+  enabled: boolean;
+  unavailableReason?: string;
 };
 
 type DbConnection = {
@@ -93,12 +95,17 @@ type ApiSettings = {
   maxRedirects: number;
 };
 
+type AppCapabilities = {
+  apiProxyEnabled: boolean;
+  fileConnectors: Partial<Record<ConnectorType, boolean>>;
+};
+
 const fileConnectors: FileConnection[] = [
-  { id: 's3', type: 's3', name: 'Amazon S3', status: 'disconnected', color: '#FF9900', icon: 'S3', config: {} },
-  { id: 'gcs', type: 'gcs', name: 'Google Cloud Storage', status: 'disconnected', color: '#4285F4', icon: 'GCS', config: {} },
-  { id: 'azure', type: 'azure', name: 'Azure Blob Storage', status: 'disconnected', color: '#0078D4', icon: 'AZ', config: {} },
-  { id: 'sftp', type: 'sftp', name: 'SFTP', status: 'disconnected', color: '#4A5568', icon: 'SFTP', config: {} },
-  { id: 'local', type: 'local', name: 'Local / NFS', status: 'disconnected', color: '#718096', icon: 'LOC', config: {} }
+  { id: 's3', type: 's3', name: 'Amazon S3', status: 'disconnected', color: '#FF9900', icon: 'S3', config: {}, enabled: true },
+  { id: 'gcs', type: 'gcs', name: 'Google Cloud Storage', status: 'disconnected', color: '#4285F4', icon: 'GCS', config: {}, enabled: true },
+  { id: 'azure', type: 'azure', name: 'Azure Blob Storage', status: 'disconnected', color: '#0078D4', icon: 'AZ', config: {}, enabled: true },
+  { id: 'sftp', type: 'sftp', name: 'SFTP', status: 'disconnected', color: '#4A5568', icon: 'SFTP', config: {}, enabled: false, unavailableReason: 'SFTP listing is not enabled in this deployment yet.' },
+  { id: 'local', type: 'local', name: 'Local / NFS', status: 'disconnected', color: '#718096', icon: 'LOC', config: {}, enabled: false, unavailableReason: 'Local and NFS listing require a mounted path in the deployment and are not enabled yet.' }
 ];
 
 const dbConnectors: DbConnection[] = [
@@ -121,7 +128,7 @@ const fieldsByType: Record<ConnectorType, Field[]> = {
   gcs: [
     { key: 'projectId', label: 'Project ID' },
     { key: 'bucket', label: 'Bucket Name' },
-    { key: 'serviceAccount', label: 'Service Account JSON', control: 'textarea' },
+    { key: 'serviceAccount', label: 'Service Account JSON', control: 'textarea', type: 'password' },
     { key: 'pathPrefix', label: 'Path Prefix', optional: true }
   ],
   azure: [
@@ -168,7 +175,7 @@ const dbFieldsByType: Record<DbConnection['type'], Field[]> = {
   bigquery: [
     { key: 'projectId', label: 'Project ID' },
     { key: 'dataset', label: 'Dataset' },
-    { key: 'serviceAccount', label: 'Service Account JSON', control: 'textarea' },
+    { key: 'serviceAccount', label: 'Service Account JSON', control: 'textarea', type: 'password' },
     { key: 'location', label: 'Location', optional: true }
   ]
 };
@@ -190,6 +197,11 @@ const defaultApiSettings: ApiSettings = {
   maxRedirects: 10
 };
 
+const defaultCapabilities: AppCapabilities = {
+  apiProxyEnabled: false,
+  fileConnectors: {}
+};
+
 function App() {
   const [activeSection, setActiveSection] = useState<Section>('files');
   const [connections, setConnections] = useState<FileConnection[]>(fileConnectors);
@@ -207,6 +219,7 @@ function App() {
   const totalSize = selectedResult.files.reduce((total, file) => total + file.sizeBytes, 0);
 
   function openFileEditor(connection: FileConnection) {
+    if (!connection.enabled) return;
     setEditingFile(connection);
     setEditingDb(null);
     setDraftConfig(connection.config);
@@ -448,15 +461,21 @@ function FilesPage({
       <div className="connector-grid">
         {connections.map(connection => {
           const result = fileResults[connection.id] || idleResult();
+          const isEnabled = connection.enabled;
+          const statusClass = isEnabled ? connection.status : 'saved';
+          const statusLabel = isEnabled ? (connection.status === 'connected' ? 'Connected' : 'Not Connected') : 'Coming Soon';
+          const cardMessage = isEnabled
+            ? (result.status === 'idle' ? 'No live listing yet.' : result.message)
+            : connection.unavailableReason || 'This connector is not available in this deployment yet.';
           return (
-            <article className="connector-card" key={connection.id}>
+            <article className={isEnabled ? 'connector-card' : 'connector-card disabled'} key={connection.id}>
               <div className="connector-topline">
                 <span className="connector-icon" style={{ backgroundColor: `${connection.color}20`, color: connection.color }}>{connection.icon}</span>
-                <span className={`status-pill ${connection.status}`}>{connection.status === 'connected' && <Check size={12} />}{connection.status === 'connected' ? 'Connected' : 'Not Connected'}</span>
+                <span className={`status-pill ${statusClass}`}>{connection.status === 'connected' && <Check size={12} />}{statusLabel}</span>
               </div>
               <h2>{connection.name}</h2>
-              <p className={result.status === 'error' ? 'card-error' : 'card-muted'}>{result.status === 'idle' ? 'No live listing yet.' : result.message}</p>
-              <button className="configure-button" onClick={() => onConfigure(connection)}><Settings size={14} />{connection.status === 'connected' ? 'Configure' : 'Connect'}</button>
+              <p className={isEnabled && result.status === 'error' ? 'card-error' : 'card-muted'}>{cardMessage}</p>
+              <button className="configure-button" disabled={!isEnabled} onClick={() => onConfigure(connection)}><Settings size={14} />{isEnabled ? (connection.status === 'connected' ? 'Configure' : 'Connect') : 'Unavailable'}</button>
             </article>
           );
         })}
@@ -556,8 +575,38 @@ function ApiPage() {
   const [apiKeyTarget, setApiKeyTarget] = useState<ApiKeyTarget>('query');
   const [transport, setTransport] = useState<Transport>('browser');
   const [settings, setSettings] = useState<ApiSettings>(defaultApiSettings);
+  const [capabilities, setCapabilities] = useState<AppCapabilities>(defaultCapabilities);
   const [sending, setSending] = useState(false);
   const [response, setResponse] = useState<ApiResponse | null>(null);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    fetch('/api/capabilities')
+      .then(async res => {
+        if (!res.ok) throw new Error(`Capabilities request failed with ${res.status}`);
+        const data = await res.json() as Partial<AppCapabilities>;
+        if (isMounted) {
+          setCapabilities({
+            apiProxyEnabled: Boolean(data.apiProxyEnabled),
+            fileConnectors: data.fileConnectors || {}
+          });
+        }
+      })
+      .catch(() => {
+        if (isMounted) setCapabilities(defaultCapabilities);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!capabilities.apiProxyEnabled && transport === 'server') {
+      setTransport('browser');
+    }
+  }, [capabilities.apiProxyEnabled, transport]);
 
   const headerObject = useMemo(() => {
     const next: Record<string, string> = {};
@@ -584,12 +633,15 @@ function ApiPage() {
   }
 
   function syncApiKey() {
-    if (!apiKeyName.trim()) return;
+    const key = apiKeyName.trim();
+    if (!key) return;
     if (apiKeyTarget === 'query') {
-      setParams(current => upsertRow(current, apiKeyName.trim(), apiKeyValue));
+      setParams(current => upsertRow(current, key, apiKeyValue));
+      setHeaders(current => removeRowByKey(current, key));
       setActiveTab('params');
     } else {
-      setHeaders(current => upsertRow(current, apiKeyName.trim(), apiKeyValue));
+      setHeaders(current => upsertRow(current, key, apiKeyValue));
+      setParams(current => removeRowByKey(current, key));
       setActiveTab('headers');
     }
   }
@@ -599,6 +651,9 @@ function ApiPage() {
     const started = performance.now();
     try {
       if (transport === 'server') {
+        if (!capabilities.apiProxyEnabled) {
+          throw new Error('Server proxy is disabled for this deployment. Use browser fetch, or enable EZ_CONNECT_ENABLE_API_PROXY after adding app auth and rate limits.');
+        }
         const res = await fetch('/api/http/request', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -715,7 +770,7 @@ function ApiPage() {
                   <button className="secondary-action" onClick={syncApiKey}>
                     {apiKeyTarget === 'query' ? 'Sync to Params' : 'Sync to Headers'}
                   </button>
-                  <span>{apiKeyTarget === 'query' ? 'The request URL will include this key as a query parameter.' : 'The request will include this key as a header.'}</span>
+                  <span>{apiKeyTarget === 'query' ? 'Sync moves this key to query params and removes the matching header.' : 'Sync moves this key to headers and removes the matching query param.'}</span>
                 </div>
               </div>
             )}
@@ -742,7 +797,7 @@ function ApiPage() {
           <label className="form-field body-editor">Raw Body<textarea rows={14} value={body} onChange={event => setBody(event.target.value)} disabled={['GET', 'HEAD'].includes(method)} /></label>
         )}
 
-        {activeTab === 'settings' && <ApiSettingsPanel settings={settings} transport={transport} onSettingsChange={setSettings} onTransportChange={setTransport} />}
+        {activeTab === 'settings' && <ApiSettingsPanel apiProxyEnabled={capabilities.apiProxyEnabled} settings={settings} transport={transport} onSettingsChange={setSettings} onTransportChange={setTransport} />}
       </section>
 
       <section className="api-panel response-panel">
@@ -792,11 +847,13 @@ function KeyValueEditor({
 }
 
 function ApiSettingsPanel({
+  apiProxyEnabled,
   settings,
   transport,
   onSettingsChange,
   onTransportChange
 }: {
+  apiProxyEnabled: boolean;
   settings: ApiSettings;
   transport: Transport;
   onSettingsChange: (settings: ApiSettings) => void;
@@ -809,10 +866,11 @@ function ApiSettingsPanel({
       <SettingRow
         label="Transport"
         description="Choose whether the browser sends the request directly or asks the server proxy to send it."
+        defaultText={apiProxyEnabled ? 'Default: Browser fetch' : 'Server proxy disabled'}
         control={
           <select className="compact-select" value={transport} onChange={event => onTransportChange(event.target.value as Transport)}>
             <option value="browser">Browser fetch</option>
-            <option value="server">Server proxy</option>
+            <option value="server" disabled={!apiProxyEnabled}>Server proxy</option>
           </select>
         }
       />
@@ -891,19 +949,41 @@ function ConfigModal({
   onPrimary: () => void;
   onSecondary: () => void;
 }) {
+  const [revealedSecrets, setRevealedSecrets] = useState<Record<string, boolean>>({});
+
+  function toggleSecret(key: string) {
+    setRevealedSecrets(current => ({ ...current, [key]: !current[key] }));
+  }
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <section className="modal" onClick={event => event.stopPropagation()}>
         <header><h2>{title}</h2><button onClick={onClose} aria-label="Close"><X size={18} /></button></header>
         <div className="modal-body">
-          {fields.map(field => (
-            <label className="form-field" key={field.key}>
-              {field.label}{field.optional && <span>Optional</span>}
-              {field.control === 'textarea'
-                ? <textarea rows={field.key === 'serviceAccount' ? 7 : 4} placeholder={field.placeholder || ''} value={config[field.key] || ''} onChange={event => onChange({ ...config, [field.key]: event.target.value })} />
-                : <input type={field.type || 'text'} placeholder={field.placeholder || ''} value={config[field.key] || ''} onChange={event => onChange({ ...config, [field.key]: event.target.value })} />}
-            </label>
-          ))}
+          {fields.map(field => {
+            const isSecretTextarea = field.control === 'textarea' && field.type === 'password';
+            const isRevealed = Boolean(revealedSecrets[field.key]);
+
+            return (
+              <label className="form-field" key={field.key}>
+                {field.label}{field.optional && <span>Optional</span>}
+                {field.control === 'textarea'
+                  ? (
+                    <div className={isSecretTextarea ? 'secret-control' : undefined}>
+                      <textarea
+                        className={isSecretTextarea && !isRevealed ? 'secret-textarea masked' : 'secret-textarea'}
+                        rows={field.key === 'serviceAccount' ? 7 : 4}
+                        placeholder={field.placeholder || ''}
+                        value={config[field.key] || ''}
+                        onChange={event => onChange({ ...config, [field.key]: event.target.value })}
+                      />
+                      {isSecretTextarea && <button className="secret-toggle" type="button" onClick={() => toggleSecret(field.key)}>{isRevealed ? 'Hide Secret' : 'Show Secret'}</button>}
+                    </div>
+                  )
+                  : <input type={field.type || 'text'} placeholder={field.placeholder || ''} value={config[field.key] || ''} onChange={event => onChange({ ...config, [field.key]: event.target.value })} />}
+              </label>
+            );
+          })}
           {message && <div className={message.includes('Missing') || message.includes('failed') || message.includes('returned') || message.includes('not enabled') ? 'message error' : 'message success'}>{message}</div>}
         </div>
         <footer><button className="secondary-action" onClick={onSecondary}>{secondaryLabel}</button><button className="primary-action" onClick={onPrimary}>{primaryLabel}</button></footer>
@@ -995,6 +1075,11 @@ function upsertRow(rows: HeaderRow[], key: string, value: string) {
   }
 
   return rows.map((row, index) => index === existingIndex ? { ...row, key, value, enabled: true } : row);
+}
+
+function removeRowByKey(rows: HeaderRow[], key: string) {
+  const normalizedKey = key.trim().toLowerCase();
+  return rows.filter(row => row.key.trim().toLowerCase() !== normalizedKey);
 }
 
 function idleResult(): FileResult {

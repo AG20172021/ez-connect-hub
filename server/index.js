@@ -1,4 +1,4 @@
-import { createHmac, createHash, createSign } from 'node:crypto';
+import { createHmac, createHash, createSign, timingSafeEqual } from 'node:crypto';
 import { createReadStream, promises as fs } from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -9,6 +9,15 @@ const staticRoot = path.resolve(__dirname, '../dist');
 const port = Number(process.env.PORT || 80);
 const maxBodyBytes = 1024 * 1024;
 const maxResponseBytes = 1024 * 1024;
+const authRequired = process.env.EZ_CONNECT_AUTH_DISABLED !== 'true';
+const authPassword = String(process.env.EZ_CONNECT_AUTH_PASSWORD || '');
+const authSecret = String(process.env.EZ_CONNECT_AUTH_SECRET || authPassword || '');
+const configuredAuthTtlSeconds = Number(process.env.EZ_CONNECT_AUTH_TTL_SECONDS || 12 * 60 * 60);
+const authTokenTtlSeconds = Number.isFinite(configuredAuthTtlSeconds) ? Math.max(configuredAuthTtlSeconds, 5 * 60) : 12 * 60 * 60;
+const protectedApiRoutes = new Set(['/api/files/list', '/api/database/test', '/api/http/request']);
+const loginWindowMs = 15 * 60 * 1000;
+const maxFailedLogins = 10;
+const failedLoginAttempts = new Map();
 
 const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
@@ -36,6 +45,17 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/auth/status') {
+      sendJson(res, 200, authStatus(req));
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/auth/login') {
+      const payload = await readJson(req);
+      sendJson(res, 200, authenticateLogin(req, payload));
+      return;
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/capabilities') {
       sendJson(res, 200, {
         apiProxyEnabled: process.env.EZ_CONNECT_ENABLE_API_PROXY === 'true',
@@ -48,6 +68,10 @@ const server = http.createServer(async (req, res) => {
         }
       });
       return;
+    }
+
+    if (protectedApiRoutes.has(url.pathname)) {
+      requireAuthenticated(req);
     }
 
     if (req.method === 'POST' && url.pathname === '/api/files/list') {
@@ -114,6 +138,139 @@ function sendJson(res, statusCode, body) {
     'cache-control': 'no-store'
   });
   res.end(json);
+}
+
+function authConfigured() {
+  return Boolean(authPassword);
+}
+
+function authStatus(req) {
+  const verified = verifyAuthToken(authTokenFromRequest(req));
+  return {
+    required: authRequired,
+    configured: authConfigured(),
+    authenticated: !authRequired || verified.valid,
+    expiresAt: verified.expiresAt
+  };
+}
+
+function authenticateLogin(req, payload) {
+  if (!authRequired) {
+    return { token: '', expiresAt: null };
+  }
+  if (!authConfigured()) {
+    throw new AppError(503, 'Authentication is required but EZ_CONNECT_AUTH_PASSWORD is not configured.');
+  }
+
+  assertLoginRateLimit(req);
+  const password = String(payload?.password || '');
+  if (!passwordMatches(password)) {
+    recordFailedLogin(req);
+    throw new AppError(401, 'Invalid app password');
+  }
+
+  clearFailedLogins(req);
+  return issueAuthToken();
+}
+
+function requireAuthenticated(req) {
+  if (!authRequired) return;
+  if (!authConfigured()) {
+    throw new AppError(503, 'Authentication is required before accepting credentials. Set EZ_CONNECT_AUTH_PASSWORD for this deployment.');
+  }
+
+  const verified = verifyAuthToken(authTokenFromRequest(req));
+  if (!verified.valid) throw new AppError(401, 'Authentication required');
+}
+
+function issueAuthToken() {
+  const expiresAtMs = Date.now() + authTokenTtlSeconds * 1000;
+  const payload = {
+    aud: 'ez-connect-hub',
+    exp: Math.floor(expiresAtMs / 1000),
+    iat: Math.floor(Date.now() / 1000),
+    v: 1
+  };
+  const encodedPayload = toBase64Url(JSON.stringify(payload));
+  return {
+    token: `${encodedPayload}.${signAuth(encodedPayload)}`,
+    expiresAt: new Date(expiresAtMs).toISOString()
+  };
+}
+
+function verifyAuthToken(token) {
+  if (!authRequired) return { valid: true };
+  if (!authConfigured() || !authSecret || !token) return { valid: false };
+
+  const [encodedPayload, signature, ...extra] = String(token).split('.');
+  if (!encodedPayload || !signature || extra.length) return { valid: false };
+  if (!safeEqualString(signAuth(encodedPayload), signature)) return { valid: false };
+
+  try {
+    const payload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8'));
+    const expiresAt = Number(payload.exp || 0) * 1000;
+    if (payload.aud !== 'ez-connect-hub' || expiresAt <= Date.now()) return { valid: false };
+    return { valid: true, expiresAt: new Date(expiresAt).toISOString() };
+  } catch {
+    return { valid: false };
+  }
+}
+
+function authTokenFromRequest(req) {
+  const authorization = String(req.headers.authorization || '');
+  if (authorization.toLowerCase().startsWith('bearer ')) {
+    return authorization.slice('bearer '.length).trim();
+  }
+  return String(req.headers['x-ez-connect-auth'] || '').trim();
+}
+
+function signAuth(value) {
+  return toBase64Url(createHmac('sha256', authSecret).update(value).digest());
+}
+
+function toBase64Url(value) {
+  return Buffer.from(value).toString('base64url');
+}
+
+function passwordMatches(candidate) {
+  const actual = createHash('sha256').update(authPassword).digest();
+  const proposed = createHash('sha256').update(String(candidate)).digest();
+  return timingSafeEqual(actual, proposed);
+}
+
+function safeEqualString(left, right) {
+  const leftBuffer = Buffer.from(String(left));
+  const rightBuffer = Buffer.from(String(right));
+  if (leftBuffer.length !== rightBuffer.length) return false;
+  return timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function assertLoginRateLimit(req) {
+  const key = loginRateKey(req);
+  const attempts = currentLoginAttempts(key);
+  if (attempts.length >= maxFailedLogins) {
+    throw new AppError(429, 'Too many failed sign-in attempts. Try again later.');
+  }
+}
+
+function recordFailedLogin(req) {
+  const key = loginRateKey(req);
+  failedLoginAttempts.set(key, [...currentLoginAttempts(key), Date.now()]);
+}
+
+function clearFailedLogins(req) {
+  failedLoginAttempts.delete(loginRateKey(req));
+}
+
+function currentLoginAttempts(key) {
+  const now = Date.now();
+  const attempts = (failedLoginAttempts.get(key) || []).filter(timestamp => now - timestamp < loginWindowMs);
+  failedLoginAttempts.set(key, attempts);
+  return attempts;
+}
+
+function loginRateKey(req) {
+  return String(req.headers['fly-client-ip'] || req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
 }
 
 async function testDatabase(payload) {

@@ -46,6 +46,8 @@ button:disabled {
 
 .sidebar {
   width: 260px;
+  display: flex;
+  flex-direction: column;
   background: white;
   border-right: 1px solid var(--gray-200);
 }
@@ -73,6 +75,16 @@ button:disabled {
   display: grid;
   gap: 4px;
   padding: 12px 8px;
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  padding: 12px 8px 16px;
+  border-top: 1px solid var(--gray-200);
+}
+
+.nav-item.sign-out {
+  color: var(--gray-500);
 }
 
 .nav-item {
@@ -104,6 +116,54 @@ button:disabled {
   min-width: 0;
   padding: 32px;
   overflow: auto;
+}
+
+.auth-screen {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: 24px;
+  background: var(--gray-50);
+}
+
+.auth-panel {
+  width: min(420px, 100%);
+  display: grid;
+  gap: 16px;
+  padding: 28px;
+  background: white;
+  border: 1px solid var(--gray-200);
+  border-radius: 8px;
+  box-shadow: 0 20px 48px rgba(15, 23, 42, .12);
+}
+
+.auth-mark {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 8px;
+  background: var(--blue-soft);
+  color: var(--blue);
+}
+
+.auth-panel h1 {
+  font-size: 24px;
+}
+
+.auth-panel p {
+  color: var(--gray-500);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.auth-panel form {
+  display: grid;
+  gap: 14px;
+}
+
+.auth-panel .primary-action {
+  width: 100%;
 }
 
 .section-header {

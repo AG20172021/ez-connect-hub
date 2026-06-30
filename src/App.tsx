@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { ReactNode } from 'react';
-import { Check, ChevronDown, Database, FileText, FolderOpen, Globe, HardDrive, Plus, RefreshCw, Send, Settings, ShieldCheck, Trash2, X, Zap } from 'lucide-react';
+import type { FormEvent, ReactNode } from 'react';
+import { Check, ChevronDown, Database, FileText, FolderOpen, Globe, HardDrive, LogOut, Plus, RefreshCw, Send, Settings, ShieldCheck, Trash2, X, Zap } from 'lucide-react';
 
 type Section = 'files' | 'database' | 'api';
 type ConnectorType = 's3' | 'gcs' | 'azure' | 'sftp' | 'local';
@@ -99,6 +99,15 @@ type AppCapabilities = {
   apiProxyEnabled: boolean;
   fileConnectors: Partial<Record<ConnectorType, boolean>>;
 };
+
+type AuthStatus = {
+  required: boolean;
+  configured: boolean;
+  authenticated: boolean;
+  expiresAt?: string;
+};
+
+const authStorageKey = 'ez-connect-auth-token';
 
 const fileConnectors: FileConnection[] = [
   { id: 's3', type: 's3', name: 'Amazon S3', status: 'disconnected', color: '#FF9900', icon: 'S3', config: {}, enabled: true },
@@ -202,6 +211,12 @@ const defaultCapabilities: AppCapabilities = {
   fileConnectors: {}
 };
 
+const defaultAuthStatus: AuthStatus = {
+  required: true,
+  configured: false,
+  authenticated: false
+};
+
 function App() {
   const [activeSection, setActiveSection] = useState<Section>('files');
   const [connections, setConnections] = useState<FileConnection[]>(fileConnectors);
@@ -212,11 +227,100 @@ function App() {
   const [editingDb, setEditingDb] = useState<DbConnection | null>(null);
   const [draftConfig, setDraftConfig] = useState<Record<string, string>>({});
   const [modalMessage, setModalMessage] = useState('');
+  const [appAuthToken, setAppAuthToken] = useState(readStoredAuthToken);
+  const [authStatus, setAuthStatus] = useState<AuthStatus>(defaultAuthStatus);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState('');
 
   const selectedSource = connections.find(connection => connection.id === selectedId) || connections[0];
   const selectedResult = fileResults[selectedSource.id] || idleResult();
   const connectedSources = connections.filter(connection => connection.status === 'connected');
   const totalSize = selectedResult.files.reduce((total, file) => total + file.sizeBytes, 0);
+  const isAuthenticated = !authStatus.required || authStatus.authenticated;
+
+  useEffect(() => {
+    let isMounted = true;
+
+    setAuthLoading(true);
+    fetch('/api/auth/status', { headers: appAuthHeaders(appAuthToken) })
+      .then(async response => {
+        const body = await response.json();
+        if (!response.ok || body.error) throw new Error(body.error || `Request failed with ${response.status}`);
+        const nextStatus = normalizeAuthStatus(body);
+        if (!nextStatus.authenticated && appAuthToken) {
+          clearStoredAuthToken();
+          setAppAuthToken('');
+        }
+        if (isMounted) {
+          setAuthStatus(nextStatus);
+          setAuthError('');
+        }
+      })
+      .catch(error => {
+        if (isMounted) {
+          setAuthStatus(defaultAuthStatus);
+          setAuthError(error instanceof Error ? error.message : 'Unable to check authentication status');
+        }
+      })
+      .finally(() => {
+        if (isMounted) setAuthLoading(false);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [appAuthToken]);
+
+  async function handleSignIn(password: string) {
+    setAuthError('');
+    setAuthLoading(true);
+    try {
+      const response = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ password })
+      });
+      const body = await response.json();
+      if (!response.ok || body.error) throw new Error(body.error || `Request failed with ${response.status}`);
+      const token = String(body.token || '');
+      storeAuthToken(token);
+      setAppAuthToken(token);
+      setAuthStatus({ required: true, configured: true, authenticated: true, expiresAt: body.expiresAt });
+    } catch (error) {
+      clearStoredAuthToken();
+      setAppAuthToken('');
+      setAuthError(error instanceof Error ? error.message : 'Unable to sign in');
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  function resetProtectedState() {
+    setConnections(fileConnectors);
+    setDbConnections(dbConnectors);
+    setFileResults({});
+    setSelectedId('s3');
+    setEditingFile(null);
+    setEditingDb(null);
+    setDraftConfig({});
+    setModalMessage('');
+  }
+
+  function handleSignOut() {
+    clearStoredAuthToken();
+    resetProtectedState();
+    setAppAuthToken('');
+    setAuthStatus(current => ({ ...current, authenticated: false, expiresAt: undefined }));
+    setAuthError('');
+  }
+
+  function handleUnauthorized() {
+    clearStoredAuthToken();
+    resetProtectedState();
+    setAppAuthToken('');
+    setAuthStatus(current => ({ ...current, authenticated: false, expiresAt: undefined }));
+    setAuthError('Your session expired. Sign in again before entering credentials.');
+  }
 
   function openFileEditor(connection: FileConnection) {
     if (!connection.enabled) return;
@@ -276,10 +380,11 @@ function App() {
     try {
       const response = await fetch('/api/files/list', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: appAuthHeaders(appAuthToken, { 'content-type': 'application/json' }),
         body: JSON.stringify({ type: connection.type, config })
       });
       const body = await response.json();
+      if (response.status === 401) handleUnauthorized();
       if (!response.ok || body.error) throw new Error(body.error || `Request failed with ${response.status}`);
 
       const result: FileResult = {
@@ -332,10 +437,11 @@ function App() {
     try {
       const response = await fetch('/api/database/test', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: appAuthHeaders(appAuthToken, { 'content-type': 'application/json' }),
         body: JSON.stringify({ type: editingDb.type, config: draftConfig })
       });
       const body = await response.json();
+      if (response.status === 401) handleUnauthorized();
       if (!response.ok || body.error) throw new Error(body.error || `Request failed with ${response.status}`);
 
       setDbConnections(current => current.map(connection => connection.id === editingDb.id
@@ -357,6 +463,10 @@ function App() {
     }
   }
 
+  if (!isAuthenticated) {
+    return <AuthGate error={authError} loading={authLoading} status={authStatus} onSignIn={handleSignIn} />;
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -366,6 +476,11 @@ function App() {
           <NavButton active={activeSection === 'database'} icon={<Database size={19} />} label="Database Connections" onClick={() => setActiveSection('database')} />
           <NavButton active={activeSection === 'api'} icon={<Globe size={19} />} label="API Connections" onClick={() => setActiveSection('api')} />
         </nav>
+        {authStatus.required && (
+          <div className="sidebar-footer">
+            <button className="nav-item sign-out" onClick={handleSignOut}><LogOut size={18} /><span>Sign Out</span></button>
+          </div>
+        )}
       </aside>
 
       <main className="main-content">
@@ -385,7 +500,7 @@ function App() {
         )}
 
         {activeSection === 'database' && <DatabasePage connections={dbConnections} onConfigure={openDbEditor} />}
-        {activeSection === 'api' && <ApiPage />}
+        {activeSection === 'api' && <ApiPage appAuthToken={appAuthToken} onUnauthorized={handleUnauthorized} />}
       </main>
 
       {editingFile && (
@@ -418,6 +533,58 @@ function App() {
         />
       )}
     </div>
+  );
+}
+
+function AuthGate({
+  error,
+  loading,
+  status,
+  onSignIn
+}: {
+  error: string;
+  loading: boolean;
+  status: AuthStatus;
+  onSignIn: (password: string) => Promise<void>;
+}) {
+  const [password, setPassword] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const configured = status.configured;
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!configured || !password.trim()) return;
+    setSubmitting(true);
+    await onSignIn(password);
+    setSubmitting(false);
+  }
+
+  return (
+    <main className="auth-screen">
+      <section className="auth-panel">
+        <div className="auth-mark"><ShieldCheck size={22} /></div>
+        <h1>Sign in to EZ Connect</h1>
+        <p>Source credentials and live listings are protected by app access.</p>
+        {!configured && !loading && (
+          <div className="message error">Authentication is required but EZ_CONNECT_AUTH_PASSWORD is not configured for this deployment.</div>
+        )}
+        {error && <div className="message error">{error}</div>}
+        <form onSubmit={submit}>
+          <label className="form-field">App Password
+            <input
+              autoComplete="current-password"
+              disabled={!configured || loading || submitting}
+              type="password"
+              value={password}
+              onChange={event => setPassword(event.target.value)}
+            />
+          </label>
+          <button className="primary-action" disabled={!configured || loading || submitting || !password.trim()} type="submit">
+            <ShieldCheck size={15} />{loading || submitting ? 'Checking...' : 'Sign In'}
+          </button>
+        </form>
+      </section>
+    </main>
   );
 }
 
@@ -560,7 +727,7 @@ function DatabasePage({ connections, onConfigure }: { connections: DbConnection[
   );
 }
 
-function ApiPage() {
+function ApiPage({ appAuthToken, onUnauthorized }: { appAuthToken: string; onUnauthorized: () => void }) {
   const [method, setMethod] = useState<RequestMethod>('GET');
   const [url, setUrl] = useState('https://api.github.com/repos/AG20172021/ez-connect-hub');
   const [params, setParams] = useState<HeaderRow[]>([{ id: 'sample-param', key: '', value: '', enabled: true }]);
@@ -656,10 +823,11 @@ function ApiPage() {
         }
         const res = await fetch('/api/http/request', {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: appAuthHeaders(appAuthToken, { 'content-type': 'application/json' }),
           body: JSON.stringify({ method, url: requestUrl, headers: headerObject, body })
         });
         const data = await res.json();
+        if (res.status === 401) onUnauthorized();
         if (!res.ok || data.error) throw new Error(data.error || `Request failed with ${res.status}`);
         setResponse({ ...data, timeMs: data.timeMs || Math.round(performance.now() - started) });
       } else {
@@ -1002,6 +1170,44 @@ function SummaryItem({ icon, value, label }: { icon: ReactNode; value: string; l
 
 function EmptyState({ title }: { title: string }) {
   return <div className="empty-state"><FolderOpen size={32} /><h2>{title}</h2></div>;
+}
+
+function readStoredAuthToken() {
+  try {
+    return window.sessionStorage.getItem(authStorageKey) || '';
+  } catch {
+    return '';
+  }
+}
+
+function storeAuthToken(token: string) {
+  try {
+    window.sessionStorage.setItem(authStorageKey, token);
+  } catch {
+    // Session storage can be unavailable in restrictive browser modes.
+  }
+}
+
+function clearStoredAuthToken() {
+  try {
+    window.sessionStorage.removeItem(authStorageKey);
+  } catch {
+    // Session storage can be unavailable in restrictive browser modes.
+  }
+}
+
+function appAuthHeaders(token: string, headers: Record<string, string> = {}) {
+  return token ? { ...headers, Authorization: `Bearer ${token}` } : headers;
+}
+
+function normalizeAuthStatus(value: Partial<AuthStatus>): AuthStatus {
+  const required = value.required !== false;
+  return {
+    required,
+    configured: Boolean(value.configured),
+    authenticated: !required || Boolean(value.authenticated),
+    expiresAt: typeof value.expiresAt === 'string' ? value.expiresAt : undefined
+  };
 }
 
 function updateHeader(headers: HeaderRow[], setHeaders: (headers: HeaderRow[]) => void, index: number, patch: Partial<HeaderRow>) {
